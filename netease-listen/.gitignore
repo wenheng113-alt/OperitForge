@@ -1,0 +1,12 @@
+node_modules/
+*.log
+*.bak
+*.bak_*
+backup/
+avatar_me.*
+avatar_by.*
+.operit_sync.json
+public/*.bak_*
+public/*.current
+public/test_input*.html
+player_v3.template.html
