@@ -11,6 +11,7 @@
  *   - mode：模式切换、缺 cookie 时报错、能力矩阵
  *   - room：commandInfo / playlistParam 的"JSON 字符串套 JSON"形态
  *   - sync：进度计算、状态签名、上行队列串行、远端合并仲裁
+ *   - im：云信房间聊天（取 token / 消息解析 / 系统通知区分）
  */
 const assert = require('assert');
 const fs = require('fs');
@@ -24,6 +25,7 @@ const room = require('./native/room.js');
 const sync = require('./native/sync.js');
 const mode = require('./native/mode.js');
 const message = require('./native/message.js');
+const im = require('./native/im.js');
 
 let passed = 0;
 let failed = 0;
@@ -567,6 +569,120 @@ test('sendToRoom 缺 chatroomId 时明确报错', function () {
     function () { throw new Error('应当拒绝'); },
     function (e) { assert.ok(/chatroomId/.test(e.message)); },
   );
+});
+
+
+/* ------------------------------------------------- im：云信房间聊天 */
+
+test('im：appKey 是客户端常量，非接口下发', function () {
+  assert.strictEqual(im.NIM_APP_KEY, '3a6a3e48f6854dfa4e4464f3bdaec3b4');
+  assert.strictEqual(im.NIM_APP_KEY.length, 32);
+});
+
+test('im：fetchToken 传 roomId，命中 token/get（v0.5 突破点）', function () {
+  const calls = [];
+  const fake = {
+    eapiRequest: function (p, b) {
+      calls.push({ p: p, b: b });
+      return Promise.resolve({ code: 200, data: { uid: '1', accId: '1', token: 'tk' } });
+    },
+  };
+  const svc = new im.RoomChatService({ client: fake });
+  return svc.fetchToken('abc_123').then(function (t) {
+    assert.strictEqual(calls[0].p, '/api/middle/im/token/get');
+    assert.deepStrictEqual(calls[0].b, { roomId: 'abc_123' });
+    assert.strictEqual(t.token, 'tk');
+  });
+});
+
+test('im：fetchToken 失败时抛出（code!=200）', function () {
+  const fake = { eapiRequest: function () { return Promise.resolve({ code: 400 }); } };
+  const svc = new im.RoomChatService({ client: fake });
+  return svc.fetchToken('r').then(
+    function () { throw new Error('应当拒绝'); },
+    function (e) { assert.ok(/token/.test(e.message)); },
+  );
+});
+
+test('im：parseMessage 解析真人文字消息', function () {
+  const raw = {
+    messageClientId: 'abc123',
+    messageType: 0,
+    senderId: '10000000002',
+    roomId: '123456789',
+    createTime: 1789399367322,
+    isSelf: false,
+    text: '测试测试',
+    serverExtension: JSON.stringify({
+      serverExt: { gender: 1, avatarUrl: 'http://x/a.jpg', nickname: '测试用户B', userId: 10000000002 },
+      appName: 'music',
+      clientExt: { bizType: 'listenTogether', ltType: 'FRIEND', roomId: '0a9b_1' },
+    }),
+  };
+  const m = im.parseMessage(raw);
+  assert.strictEqual(m.text, '测试测试');
+  assert.strictEqual(m.senderId, '10000000002');
+  assert.strictEqual(m.senderNick, '测试用户B');
+  assert.strictEqual(m.senderAvatar, 'http://x/a.jpg');
+  assert.strictEqual(m.messageType, 0);
+  assert.strictEqual(m.isNotification, false);
+  assert.strictEqual(m.isSelf, false);
+  assert.strictEqual(m.time, 1789399367322);
+});
+
+test('im：系统通知（messageType=5）无 text 但被标记', function () {
+  const m = im.parseMessage({
+    messageClientId: 'n1',
+    messageType: 5,
+    senderId: '10000000001',
+    isSelf: true,
+    attachment: { type: 0, operatorId: '10000000001' },
+  });
+  assert.strictEqual(m.text, '');
+  assert.strictEqual(m.isNotification, true, '进房/退房通知必须可识别，不能当空消息丢掉');
+  assert.strictEqual(m.isSelf, true);
+});
+
+test('im：parseSenderExt 容错（无 ext / 非法 JSON）', function () {
+  assert.strictEqual(im.parseSenderExt({}), null);
+  assert.strictEqual(im.parseSenderExt({ serverExtension: 'not json' }), null);
+  const m = im.parseMessage({ messageType: 0, text: 'x' });
+  assert.strictEqual(m.senderNick, '');
+  assert.strictEqual(m.senderId, '');
+});
+
+test('im：serverExtension 已解析成对象时也能取到', function () {
+  const ext = im.parseSenderExt({ serverExt: { nickname: 'A', userId: 9 } });
+  assert.strictEqual(ext.nickname, 'A');
+  assert.strictEqual(ext.userId, '9');
+});
+
+test('im：未 enter 时 history / send 明确报错', function () {
+  const svc = new im.RoomChatService({ client: {} });
+  return Promise.all([
+    svc.history().then(function () { throw new Error('history 应当拒绝'); },
+      function (e) { assert.ok(/enter/.test(e.message)); }),
+    svc.send('hi').then(function () { throw new Error('send 应当拒绝'); },
+      function (e) { assert.ok(/enter/.test(e.message)); }),
+  ]);
+});
+
+test('im：enter 缺 roomId / chatroomId 时明确报错', function () {
+  const svc = new im.RoomChatService({ client: {} });
+  return Promise.all([
+    svc.enter({ chatroomId: '1' }).then(function () { throw new Error('应当拒绝'); },
+      function (e) { assert.ok(/roomId/.test(e.message)); }),
+    svc.enter({ roomId: 'r' }).then(function () { throw new Error('应当拒绝'); },
+      function (e) { assert.ok(/chatroomId/.test(e.message)); }),
+  ]);
+});
+
+test('im：send 空消息被拒绝', function () {
+  const svc = new im.RoomChatService({ client: {} });
+  svc.instance = { V2NIMChatroomService: {}, account: function () { return '1'; } };
+  svc.chatroomId = '1';
+  return svc.send('').then(function () { throw new Error('应当拒绝'); },
+    function (e) { assert.ok(/空/.test(e.message)); });
 });
 
 /* --------------------------------------------------------------- 汇总 */

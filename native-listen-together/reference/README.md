@@ -3,7 +3,7 @@
 > ⚠️ **这些文件不在 `netease-listen/` 仓库里，也尚未接入 `server.js`。**
 > 它们是交给第三方开发者的参考实现，可直接搬进项目。
 
-配套文档：上级目录 `PLAN-native.md`（计划书 v0.2）
+配套文档：上级目录 `PLAN-native.md`（计划书 v0.5）
 
 ---
 
@@ -14,7 +14,7 @@ cd reference
 node selftest.js
 ```
 
-预期输出：**通过 35 / 失败 0**
+预期输出：**通过 63 / 失败 0**
 
 自检是离线的（不发网络请求），但会**尽量**读取以下外部 fixture 做逐字节比对；
 读不到时自动跳过该组，不算失败：
@@ -35,13 +35,31 @@ node selftest.js
 | `native/invite.js` | 邀请私信解析（`parseInvite` / `extractInvites`） |
 | `native/sync.js` | 本地状态 ↔ 网易云房间 双向同步引擎（`SyncEngine`，轮询） |
 | `native/mode.js` | 三个模式的状态机与能力矩阵（`ModeManager`） |
+| `native/message.js` | 私信收发（`MessageService`）：发私信 / 会话列表 / 捞邀请 |
+| `native/im.js` | **房间聊天**（`RoomChatService`）：云信登录 / 实时收 / 拉历史 / 发言 |
 
 ---
 
 ## 依赖
 
-**零依赖** —— 只用 Node 内置模块：`crypto` / `http` / `https` / `fs` / `path`。
+核心模块**零依赖** —— 只用 Node 内置模块：`crypto` / `http` / `https` / `fs` / `path`。
 Node >= 16 即可（与现有项目一致）。
+
+**唯一例外是 `native/im.js`**（读房间聊天）：它需要官方云信 SDK
+
+```bash
+npm install nim-web-sdk-ng        # 实测 10.11.0 可用
+```
+
+SDK 是浏览器产物，在 Node 里跑要先补浏览器全局对象：
+
+```js
+const im = require('./native/im.js');
+im.installBrowserGlobals();       // ⚠️ 必须在 import SDK 之前
+```
+
+若 SDK 不在常规位置，用 `NIM_SDK_DIR` 环境变量或 `enter({ sdkDir })` 指定。
+Node 18+ 自带 `WebSocket`，无需额外 polyfill。
 
 ---
 

@@ -2,13 +2,13 @@
 
 > 交付给第三方开发者实施。**本计划书与参考代码均未改动 `netease-listen/` 任何文件。**
 >
-> 参考代码在 `reference/`，自检通过 **53/53**，并已用真实 cookie 完成端到端实测
+> 参考代码在 `reference/`，自检通过 **63/63**，并已用真实 cookie 完成端到端实测
 > （建房 → 邀请 → 真人加入 → 双向同步 → 关房，全流程跑通）。
 >
 > **v0.4 关键更新（重大突破，全部经双账号真机实测）**：
 > 1. **加歌 / 换整个歌单** ✅ 已跑通 —— v0.3 判定的"不在 HTTP 层"**被推翻**（见 3.4）
 > 2. **AI 切歌 → 真人官方客户端实时跟随** ✅ 已验证
-> 3. **房间内发言** ✅ 已跑通 —— v0.3 判定的"走云信长连接够不着"**被推翻**（见 3.5）
+> 3. **房间聊天收发** ✅ 全部跑通 —— v0.4 判定的"只能发不能读"**被推翻**（见 3.5）
 > 4. **`playCommand` 读取路径**修正（旧代码读错位置，见 3.4）
 >
 > v0.3 的两个"否定性结论"都被证伪，教训已记录在 3.4「历史教训」一节：
@@ -312,13 +312,14 @@ C) NEXT / PAUSE         -> 生效，serverSeq 推进
 - **改播放** → `play/command/report`（`commandInfo`, `commandType:'GOTO'/'NEXT'/'PAUSE'`）
 
 
-### 3.5 ✅ 私信收发可行 / ✅ 房间内**发**言可行（读不可行）
+### 3.5 ✅ 房间聊天「发」+「读」**全部打通**（v0.5 重大突破）
 
-> **v0.4 修正**：v0.3 曾判定「房间内聊天没有 HTTP 接口，走云信长连接」——
-> **该结论错误**。Frida 抓包显示房间聊天**就是 HTTP**，只是端点名字
-> 不在 `listen/together/*` 命名空间下，所以早期按关键词爆破全部 404。
+> **v0.5 修正**：v0.4 曾判定「房间聊天只能发、不能读」——
+> **该结论只对了一半**。读是可行的，只是**不在 HTTP 层，而在云信长连接**。
+> HTTP 探测 `chatroom/{history,messages,get}` 全 404 是真的，
+> 但那只能证明「HTTP 没有读接口」，不能证明「读不了」。
 
-**房间内发言（✅ 可用，明文表单）：**
+#### 读法一：HTTP 发（v0.4 已跑通）
 
 ```
 POST https://interface3.music.163.com/api/middle/im/chatroom/send
@@ -330,44 +331,110 @@ POST https://interface3.music.163.com/api/middle/im/chatroom/send
 
 实测返回 `{"code":200,"data":{"result":true,...}}`，**真人客户端可见**。
 
-> **注意**：`roomInfo.roomRTCType === "yunxin"` 只表示**房间基于云信通道**，
-> **不代表消息只能走云信私有协议**。服务端提供了 HTTP 转发入口。
-> 这是本项目推翻的第二个"看起来像定论"的结论。
+> `roomInfo.roomRTCType === "yunxin"` 只表示房间基于云信通道，
+> 不代表消息只能走云信私有协议 —— 服务端也提供了 HTTP 发送入口。
 
-**❌ 但「读」房间聊天历史仍无解**：`/api/middle/im/chatroom/{history,messages,get}`
-与 `/api/chatroom/message/get` **全部 404**。也就是说：
+#### 读法二：云信 SDK 读（v0.5 新增，**关键突破**）
 
-- **AI → 房间发言**：✅ 可以（上面那条）
-- **读房间里的聊天**：❌ 不行（要读只能集成云信 SDK）
+**核心结论：AI 用自己的 cookie 就能读到真人说的话，不需要真人 cookie。**
+
+完整链路（已实测跑通，真人发言全部读到）：
+
+**① 取云信登录凭证** —— 用**任意身份**的 cookie：
+
+```
+POST /api/middle/im/token/get
+  roomId = <roomId>            <- ⚠️ 必需，不传 HTTP 400
+
+→ {"code":200,"data":{
+     "uid":   "10000000001",
+     "accId": "10000000001",     <- 云信账号，等于网易云 uid
+     "token": "<REDACTED>..."      <- 云信登录 token
+   }}
+```
+
+**② 云信 appKey** —— **不是接口下发**，是客户端常量：
+
+```js
+NIMClient.getAppKey()  →  '3a6a3e48f6854dfa4e4464f3bdaec3b4'
+```
+
+（该值也正好是客户端账号隔离目录名，见 §设备信息）
+
+**③ 登录并进聊天室** —— 用官方 SDK：
+
+```bash
+npm install nim-web-sdk-ng        # 实测 10.11.0 可用
+```
+
+```js
+const inst = V2NIMChatroom.newInstance({
+  appkey: APP_KEY, apiVersion: 'v2', account: accId, token: token,
+});
+await inst.enter(String(chatroomId), {
+  accountId: accId, token: token, roomNick: '...', enableLbs: true,
+});
+```
+
+**④ 两种读法**：
+
+```js
+// 实时：真人一说话就回调
+inst.V2NIMChatroomService.on('onReceiveMessages', (msgs) => { ... });
+
+// 历史：一次最多 50 条，含双方发言
+await inst.V2NIMChatroomService.getMessageList({ roomId, limit: 50 });
+```
+
+#### 实测消息结构
+
+```json
+{
+  "messageClientId": "337c9ca905994abe9e25a8b969184462",
+  "messageType": 0,                    // 0=文字 5=系统通知(进房/退房)
+  "senderId": "10000000002",
+  "roomId": "123456789",
+  "createTime": 1789399367322,
+  "isSelf": false,
+  "text": "测试测试",
+  "serverExtension": "{\"serverExt\":{\"nickname\":\"...\",\"userId\":10000000002,
+                       \"avatarUrl\":\"...\"},\"clientExt\":{\"bizType\":\"listenTogether\"}}"
+}
+```
+
+⚠️ **`serverExtension` 是 JSON 字符串**（不是对象），发送者昵称/头像在里面。
+
+#### 实测结果
+
+```
+✓ token: accId=10000000001
+✓ enter online=2
+✓ history 50 条
+  其中真人发言 11 条:
+    测试用户B: "测试测试"
+    测试用户B: "你好"
+    测试用户B: "测试"
+    测试用户B: "hi"
+```
 
 **对本项目的实际影响（重要）**：
-模式 2/3 里 AI 要"听真人说了什么"，**不能靠读房间聊天**，
-只能靠**私信**（`/api/msg/private/*`，读写都通）或**房间状态变化**
-（`playCommand` / `displayList` 轮询）。**产品设计必须按这个约束来。**
+模式 2/3 里 AI 要「听真人说了什么」，**现在完全可以做到**：
+用 AI 自己的 cookie 取 token → 登录云信 → `onReceiveMessages` 实时接收。
+**这条链路不依赖真人 cookie**，正是模式 3（only AI，真人用官方客户端）的基础。
 
-**但私信是纯 HTTP 的，且实测收发都通**：
+> 已实现为 `reference/native/im.js`（`RoomChatService`：`fetchToken` /
+> `enter` / `onMessage` / `history` / `send`），10 条测试覆盖。
+> 在 Node 里跑需要先补浏览器全局对象 —— `im.installBrowserGlobals()`，
+> 且**必须在 import SDK 之前**调用（SDK 在模块加载时就读 `window.localStorage`）。
 
-| 能力 | 接口 | 实测 |
-|---|---|---|
-| 发私信 | `/api/msg/private/send` | ✅ `code:200`，对方真收到 |
-| 会话列表 | `/api/msg/private/users` | ✅ 含 `lastMsg` 摘要 |
-| 聊天历史 | `/api/msg/private/history` | ✅ 完整双向历史 |
+#### ⚠️ 私信通道（仍然有用）
 
-**用途**：邀请传递（把 `orpheus://` 深链私信给对方）、
-AI 想对真人说句话、状态通知。**这是模式 2/3 里 AI 与真人唯一的
-文本交互通道。**
-
-#### ⚠️ 三个必须记住的坑
+私信收发也可行，用于邀请传递、状态通知。三个坑：
 
 1. **`history` 是新→旧排序**，`msgs[0]` 才是最新的。
-   按「最后一条最新」读会误判成「没发出去」——实测因此白排查了一轮。
-2. **富卡片会被降级**。照抄官方邀请卡片（`resType:23` + `generalMsg`）
-   发出去，对方客户端显示「当前版本无法显示该信息，请在应用市场下载
-   最新版app」。**发纯文本 + 深链最稳。**
-3. **正文可能二次 JSON 嵌套**：`msg` 字段本身是
-   `{"msg":"...","resType":23}` 字符串，要先 `JSON.parse` 再取 `.msg`。
-4. **长度上限**：907 字符的卡片触发 `code 2004`「发送字数超过限制」。
-   建议控制在 700 字符内。
+2. **富卡片会被降级** —— 照抄官方邀请卡片（`resType:23`）对方会看到
+   「当前版本无法显示该信息」。**发纯文本 + 深链最稳。**
+3. **正文可能二次 JSON 嵌套**：`msg` 本身是 `{"msg":"...","resType":23}` 字符串。
 
 > 已实现为 `reference/native/message.js`（含 `unwrapMessage` 剥壳 +
 > `latestInvite` 捞邀请），6 条测试覆盖。
@@ -416,7 +483,7 @@ AI 想对真人说句话、状态通知。**这是模式 2/3 里 AI 与真人唯
 | `native/sync.js` | ~330 | 双向同步（轮询） | ✅ 队列串行/仲裁/空歌单容错 |
 | `native/mode.js` | ~195 | 模式状态机 | ✅ 能力矩阵、缺 cookie 报错 |
 | `native/message.js` | ~200 | 私信收发 | ✅ 真实收发双通；富卡片降级坑已记录 |
-| `selftest.js` | ~430 | 离线自检 | ✅ **53/53 通过** |
+| `selftest.js` | ~600 | 离线自检 | ✅ **63/63 通过** |
 
 **真实 cookie 端到端实测输出**：
 
@@ -494,6 +561,7 @@ netease-listen/
 | `native_add_song` | 加歌进房间列表（`REPLACE` 全量语义，v0.4 已可用） |
 | `native_replace_playlist` | 整单替换（换歌单），v0.4 新增 |
 | `native_say_in_room` | 在房间里发一条文字消息，v0.4 新增 |
+| `native_read_room` | **读房间聊天**（实时 + 历史），v0.5 新增 |
 | `list_invites` | 从私信里解析邀请 |
 | `accept_invite` | 接受指定邀请 |
 | `native_end` | 关房 |
