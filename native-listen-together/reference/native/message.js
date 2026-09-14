@@ -38,6 +38,8 @@ const PATHS = {
   send: '/api/msg/private/send',
   users: '/api/msg/private/users',
   history: '/api/msg/private/history',
+  // ✅ v0.4：房间内发言走这个 HTTP 端点（**不是**云信长连接）
+  roomSend: '/api/middle/im/chatroom/send',
 };
 
 /** 私信正文长度上限：实测 907 字符的卡片被判「发送字数超过限制」(code 2004)。 */
@@ -128,6 +130,47 @@ class MessageService {
       type: 'text',
       msg: body,
       userIds: JSON.stringify([Number(userId) || userId]),
+    });
+  }
+
+  /**
+   * 在**一起听房间里**发一条文字消息（v0.4 已跑通，真人客户端可见）。
+   *
+   * ⚠️ v0.3 曾判定「房间内聊天走云信私有长连接，HTTP 够不着」——
+   *    **该结论错误**。实测走 HTTP 明文表单即可，只是端点不在
+   *    `listen/together/*` 命名空间下，所以按关键词爆破全部 404。
+   *
+   * 抓包得到的真实形态：
+   *   POST /api/middle/im/chatroom/send
+   *     chatroomId = <roomInfo.chatRoomId>
+   *     msgType    = 0
+   *     clientExt  = {"bizType":"listenTogether","ltType":"FRIEND","roomId":"<roomId>"}
+   *     msgBody    = {"msg":"内容","msgType":0}
+   *
+   * ⚠️ **只能发，不能读**：`chatroom/{history,messages,get}` 全部 404。
+   *    AI 想"听"真人说什么，只能用私信或轮询房间状态。
+   *
+   * @param {object} o
+   * @param {string|number} o.chatroomId roomInfo.chatRoomId
+   * @param {string} o.text 正文
+   * @param {string} [o.roomId] 一起听 roomId（放进 clientExt）
+   * @param {string} [o.ltType] 默认 FRIEND（取自 roomInfo.ltType）
+   * @returns {Promise<object>}
+   */
+  sendToRoom(o) {
+    const opts = o || {};
+    const body = String(opts.text || '');
+    if (!body) return Promise.reject(new Error('房间消息不能为空'));
+    if (!opts.chatroomId) return Promise.reject(new Error('缺少 chatroomId（取自 roomInfo.chatRoomId）'));
+    return this.client.eapiRequest(PATHS.roomSend, {
+      chatroomId: String(opts.chatroomId),
+      msgType: '0',
+      clientExt: JSON.stringify({
+        bizType: 'listenTogether',
+        ltType: opts.ltType || 'FRIEND',
+        roomId: opts.roomId || '',
+      }),
+      msgBody: JSON.stringify({ msg: body, msgType: 0 }),
     });
   }
 

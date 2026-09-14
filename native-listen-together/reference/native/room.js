@@ -12,7 +12,8 @@
  *   ✅ status/get                           查房间状态（含 roomUsers）
  *   ✅ end/v2                               关房
  *   ✅ sync/playlist/get                    双人房间返回完整状态（单人时空）
- *   ❌ sync/list/command/report（加歌）      假成功，列表不变 —— 详见下
+ *   ✅ sync/list/command/report（加歌）      **v0.4 已跑通**，见下
+ *   ✅ 整单替换（换歌单）                     **v0.4 已跑通**
  *
  * ── 关键实测结论（务必读）────────────────────────────────────
  *   ⚠️ **下行同步可行，走 HTTP 轮询**（早前"只有 Agora"的推断已被推翻）：
@@ -24,19 +25,23 @@
  *      **不是 songId**。用 songId 时接口照样返回 result:true，但 serverSeq
  *      纹丝不动 —— 典型的假成功。见 buildCommandInfo。
  *
- *   ⚠️ **加歌（sync/list/command/report）实测无效**：返回 result:true
- *      但列表恒定不变。穷举 20+ 种载荷形态（operationType / songIds /
- *      displayList / version 协商）全部失败。三个同类开源项目也都
- *      没解决。**结论：AI 只 GOTO 切房间已有的歌，加歌交给真人侧。**
+ *   ✅ **加歌/换歌单（v0.4 已跑通）**：走 sync/list/command/report，
+ *      载荷是 **commandType:'REPLACE' + 完整 displayList**（不是 ADD 增量）。
+ *      旧实现用 operationType:'ADD' 是**错的语义**，所以一直假成功。
+ *      详见 buildPlaylistParam 的注释。
  *
- *   ⚠️ `result:true` 不代表性变更成功；只有 `result:false` 是明确拒绝。
+ *   ⚠️ **playCommand 的读取路径**：在 `data.playCommand`，
+ *      **不在** `data.playlist.playCommand`。读错位置会永远拿到 undefined。
+ *
+ *   ⚠️ `result:true` 不代表性变更成功；必须**回读 playlist/get 做 diff** 才作数。
  *
  *   ⚠️ 心跳接口名在官方是拼错的 `heatbeat`，但 eapi 路径实测为
  *      `heartbeat`（本项目验证可用）；对方关房时心跳会返回 **488**
  *      （= 已由对方结束）→ 应清空本地 roomId 重找邀请。
  *
- *   roomInfo 里的 agoraChannelId / chatRoomId 说明**语音与房间内聊天**
- *   走 Agora + 网易云信通道（HTTP 够不着）；但**播放状态同步是纯 HTTP**。
+ *   roomInfo 里的 agoraChannelId 说明**语音**走 Agora；**房间内文字发言**
+ *   实测可走 HTTP（`/api/middle/im/chatroom/send`，见 message.js），
+ *   但**读取**房间聊天历史无 HTTP 接口。**播放状态同步是纯 HTTP**。
  */
 
 /** 一起听接口路径（全部实测存在）。 */
@@ -111,44 +116,57 @@ function buildCommandInfo(o) {
 }
 
 /**
- * 构造播放列表变更指令（同样是 JSON 字符串）。
+ * 构造播放列表变更指令（JSON 字符串）。
  *
- * ⚠️⚠️ 实测结论（2026-09 真机双人房间）：**ADD 加歌尚未跑通**，请勿直接使用。
+ * ✅ v0.4 已跑通 —— 这是「加减歌」的唯一正确形态。
  *
- * 观测到的房间列表真实结构（从 sync/playlist/get 读回）：
- *   { displayList: { changed, result:[songId...], rcmdSongIds:[] },
- *     randomList:  { changed, result:[] },
- *     songIdWithAlgList: null,
- *     playMode: 'ORDER_LOOP', listMode: '', listModeParam: null,
- *     replace: false,
- *     version: [{ userId, version, outerId }] }      <-- 每用户版本号
+ * ⚠️ 核心认知：**房间列表没有"加一首"的语义**，只有
+ *    「用一份完整列表 REPLACE 掉旧的」。想加歌 = 读当前列表 → 追加 → 整份发回。
  *
- * 试过的形态与结果：
- *   { operationType:'ADD', songIds:[id] }                    -> result:true，列表不变
- *   { operationType:'ADD', songId:id }                       -> result:true，列表不变
- *   { operationType:'ADD_SONG' / 'INSERT' }                  -> result:true，列表不变
- *   { operationType:'ADD', displayList:{result:[...]} }      -> **result:false**（被拒）
- *   带 version 数组的 displayList 形态                        -> result:false（被拒）
+ * 官方客户端抓包得到的真实载荷（Frida hook okhttp Request$Builder.build）：
+ *   {
+ *     "anchorPosition": 2,
+ *     "anchorSongId": "3395220104",
+ *     "clientSeq": 1789389529015,
+ *     "commandType": "REPLACE",          <- 关键：REPLACE，不是 ADD
+ *     "displayList": ["...完整列表..."],   <- 关键：必须全量
+ *     "randomList": [],
+ *     "version": [{"userId":10000000002,"version":10}]   <- 取现值直接回传
+ *   }
  *
- * 注意 `result:true` 是**假成功**（和 songId 那个坑一样，接口收下但不生效）；
- * 只有 `result:false` 是明确的拒绝信号。
+ * 旧实现（v0.3，❌ 从未生效）用的是：
+ *   { operationType:'ADD', songIds:[id], clientSeq, clientTime }
+ *   —— 语义错了（ADD 增量），所以服务端一律假成功 result:true。
  *
- * 推测：房间列表变更依赖 `version` 的每用户版本协商（乐观锁），
- * 需要带上**正确的 version 值**才可能被接受。当前实现未打通，
- * 建议抓一次「官方客户端加歌」的完整请求来确定 version 与字段形态。
+ * 实测验证（双账号真机）：
+ *   15 → 17 首（追加 2 首）   ✅
+ *   17 → 77 首（整单替换）    ✅ 真人客户端刷新手看到
  *
  * @param {object} o
- * @param {Array<string|number>} o.songIds
- * @param {string} [o.operationType]
+ * @param {Array<string|number>} o.displayList 完整歌单（必须全量！）
+ * @param {Array<{userId:number,version:number,outerId?:*}>} o.version 当前版本数组
+ * @param {string|number} [o.anchorSongId] 锚点歌（默认取列表最后一首）
+ * @param {number} [o.anchorPosition] 锚点下标（默认取列表最后一个下标）
  * @returns {string}
  */
 function buildPlaylistParam(o) {
   const t = stamp();
+  const list = (o.displayList || []).map(String);
+  const anchorSongId = o.anchorSongId != null
+    ? String(o.anchorSongId)
+    : (list.length ? list[list.length - 1] : '');
+  const anchorPosition = o.anchorPosition != null
+    ? o.anchorPosition
+    : Math.max(0, list.length - 1);
   return JSON.stringify({
-    operationType: o.operationType || 'ADD',
-    songIds: (o.songIds || []).map(String),
+    anchorPosition: anchorPosition,
+    anchorSongId: anchorSongId,
     clientSeq: t,
-    clientTime: t,
+    commandType: o.commandType || 'REPLACE',
+    displayList: list,
+    randomList: [],
+    // version 直接回传服务端当前值即可（实测无需 +1）
+    version: o.version || [],
   });
 }
 
@@ -341,6 +359,10 @@ class RoomService {
   /**
    * 读房间当前播放状态（播放列表 + 播放指令）。
    * 这是下行的核心：实测双人房间能读到真人的操作。
+   *
+   * ⚠️ 路径坑：`playCommand` 在 **`data.playCommand`**，
+   *    不在 `data.playlist.playCommand`。读错会永远拿到 undefined。
+   *
    * @param {string} [roomId]
    * @returns {Promise<{playCommand: object, list: Array, playMode: string, raw: object}>}
    */
@@ -354,21 +376,75 @@ class RoomService {
       playMode: pl.playMode || '',
       version: pl.version || [],
       raw: pl,
+      rawData: d,
       code: resp && resp.code,
     };
   }
 
   /**
-   * 把歌加进房间列表。
-   * 注意：加完对方可能需要重进 App 才能看到（实测经验）。
+   * 把歌**加进**房间列表（v0.4 已跑通）。
+   *
+   * 实现方式：读当前列表 → 追加新歌 → 整份 REPLACE 回去。
+   * 因为房间列表没有"加一首"的语义，只有全量替换。
+   *
    * @param {object} o
+   * @param {Array<string|number>} o.songIds 要追加的歌
+   * @param {string} [o.roomId]
+   * @param {boolean} [o.dedupe=true] 已在列表里的歌是否跳过
+   * @returns {Promise<{resp: object, before: number, after: number, added: Array<string>}>}
+   */
+  async addSongs(o) {
+    const opts = o || {};
+    const roomId = opts.roomId || this.roomId;
+    const cur = await this.current(roomId);
+    const before = cur.list.map(String);
+    const incoming = (opts.songIds || []).map(String);
+    const dedupe = opts.dedupe !== false;
+    const fresh = dedupe ? incoming.filter((id) => !before.includes(id)) : incoming;
+
+    if (!fresh.length) {
+      return { resp: null, before: before.length, after: before.length, added: [] };
+    }
+
+    const displayList = before.concat(fresh);
+    const resp = await this.replaceList({
+      roomId: roomId,
+      displayList: displayList,
+      version: cur.version,
+      anchorSongId: fresh[fresh.length - 1],
+      anchorPosition: displayList.length - 1,
+    });
+    return { resp: resp, before: before.length, after: displayList.length, added: fresh };
+  }
+
+  /**
+   * 用一份**完整列表**替换房间歌单（v0.4 已跑通）。
+   * 「换歌单」和「加歌」都走这个方法。
+   *
+   * ⚠️ 返回 `result:true` **不代表生效** —— 必须回读 `current()` 比对长度才作数。
+   *
+   * @param {object} o
+   * @param {Array<string|number>} o.displayList 完整列表（全量）
+   * @param {Array} [o.version] 当前 version 数组（不传会自动读一次）
+   * @param {string} [o.roomId]
    * @returns {Promise<object>}
    */
-  addSongs(o) {
+  async replaceList(o) {
     const opts = o || {};
+    const roomId = opts.roomId || this.roomId;
+    let version = opts.version;
+    if (!version) {
+      const cur = await this.current(roomId);
+      version = cur.version;
+    }
     return this.client.eapiRequest(PATHS.listCommand, {
-      roomId: opts.roomId || this.roomId,
-      playlistParam: opts.rawPlaylistParam || buildPlaylistParam(opts),
+      roomId: roomId,
+      playlistParam: opts.rawPlaylistParam || buildPlaylistParam({
+        displayList: opts.displayList,
+        version: version,
+        anchorSongId: opts.anchorSongId,
+        anchorPosition: opts.anchorPosition,
+      }),
     });
   }
 

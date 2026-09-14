@@ -264,11 +264,67 @@ test('current() 解析房间播放状态', function () {
     assert.strictEqual(c.playMode, 'ORDER_LOOP');
   });
 });
-test('playlistParam 的 songIds 是字符串数组', function () {
-  const s = room.buildPlaylistParam({ songIds: [1, 2, 3] });
+test('playlistParam 用 REPLACE + 全量 displayList（v0.4 已跑通）', function () {
+  const s = room.buildPlaylistParam({ displayList: [1, 2, 3], version: [{ userId: 1, version: 7 }] });
   const o = JSON.parse(s);
-  assert.deepStrictEqual(o.songIds, ['1', '2', '3']);
-  assert.strictEqual(o.operationType, 'ADD');
+  assert.strictEqual(o.commandType, 'REPLACE', '必须是 REPLACE，不是 ADD');
+  assert.deepStrictEqual(o.displayList, ['1', '2', '3'], 'displayList 必须是字符串全量数组');
+  assert.deepStrictEqual(o.randomList, []);
+  assert.strictEqual(o.anchorSongId, '3', '默认锚点取列表最后一首');
+  assert.strictEqual(o.anchorPosition, 2);
+  assert.deepStrictEqual(o.version, [{ userId: 1, version: 7 }], 'version 原样回传');
+  assert.ok(!('operationType' in o), '不应再出现旧的 operationType 字段');
+  assert.ok(!('songIds' in o), '不应再出现旧的 songIds 字段');
+});
+test('addSongs 走「读列表 → 追加 → 整份 REPLACE」', function () {
+  const calls = [];
+  const fake = {
+    eapiRequest: function (p, b) {
+      calls.push({ p: p, b: b });
+      if (p === room.PATHS.playlist) {
+        return Promise.resolve({
+          code: 200,
+          data: {
+            playCommand: {},
+            playlist: {
+              displayList: { result: ['1', '2'] },
+              version: [{ userId: 5, version: 3 }],
+              playMode: 'ORDER_LOOP',
+            },
+          },
+        });
+      }
+      return Promise.resolve({ code: 200, data: { result: true } });
+    },
+  };
+  const rs = new room.RoomService(fake, { roomId: 'r' });
+  return rs.addSongs({ songIds: ['9', '2'] }).then(function (r) {
+    assert.deepStrictEqual(r.added, ['9'], '已在列表里的 2 应被去重');
+    assert.strictEqual(r.before, 2);
+    assert.strictEqual(r.after, 3);
+    const sent = JSON.parse(calls[calls.length - 1].b.playlistParam);
+    assert.strictEqual(sent.commandType, 'REPLACE');
+    assert.deepStrictEqual(sent.displayList, ['1', '2', '9'], '必须是原列表 + 新歌的全量');
+    assert.deepStrictEqual(sent.version, [{ userId: 5, version: 3 }]);
+  });
+});
+test('replaceList 用整份新列表覆盖（换歌单）', function () {
+  const calls = [];
+  const fake = {
+    eapiRequest: function (p, b) {
+      calls.push({ p: p, b: b });
+      if (p === room.PATHS.playlist) {
+        return Promise.resolve({ code: 200, data: { playlist: { displayList: { result: ['1'] }, version: [] } } });
+      }
+      return Promise.resolve({ code: 200 });
+    },
+  };
+  const rs = new room.RoomService(fake, { roomId: 'r' });
+  return rs.replaceList({ displayList: ['7', '8', '9'], version: [] }).then(function () {
+    const sent = JSON.parse(calls[calls.length - 1].b.playlistParam);
+    assert.deepStrictEqual(sent.displayList, ['7', '8', '9']);
+    assert.strictEqual(sent.commandType, 'REPLACE');
+  });
 });
 test('heartbeatChecked 识别 488（对方关房）', function () {
   const fake = { eapiRequest: function () { return Promise.resolve({ code: 488 }); } };
@@ -481,13 +537,36 @@ test('latestInvite 从会话列表里捞出邀请', function () {
     assert.strictEqual(inv.senderUid, '10000000002');
   });
 });
-test('房间内聊天端点明确不可用（记录为已知限制）', function () {
-  // 这条不是功能测试，是把「走云信、无 HTTP」这个结论钉在测试里，
-  // 防止以后有人又去试 /api/listen/together/chat/send。
+test('房间内发言走 HTTP（v0.4 推翻「云信够不着」的旧结论）', function () {
+  // v0.3 曾把「房间聊天无 HTTP 接口」钉在测试里 —— 该结论已被抓包推翻。
   assert.strictEqual(message.PATHS.send, '/api/msg/private/send');
   assert.strictEqual(message.PATHS.users, '/api/msg/private/users');
   assert.strictEqual(message.PATHS.history, '/api/msg/private/history');
-  assert.ok(!/chatroom|chat\//.test(JSON.stringify(message.PATHS)), 'PATHS 不应包含房间内聊天端点');
+  assert.strictEqual(message.PATHS.roomSend, '/api/middle/im/chatroom/send',
+    '房间内发言的端点就在 /api/middle/im/chatroom/send，不在 listen/together 命名空间下');
+});
+test('sendToRoom 构造出实测可用的明文表单', function () {
+  const calls = [];
+  const fake = { eapiRequest: function (p, b) { calls.push({ p: p, b: b }); return Promise.resolve({ code: 200 }); } };
+  const ms = new message.MessageService(fake);
+  return ms.sendToRoom({ chatroomId: 123456789, roomId: 'r1', ltType: 'FRIEND', text: 'hi' })
+    .then(function () {
+      const c = calls[0];
+      assert.strictEqual(c.p, '/api/middle/im/chatroom/send');
+      assert.strictEqual(c.b.chatroomId, '123456789');
+      assert.strictEqual(c.b.msgType, '0');
+      assert.deepStrictEqual(JSON.parse(c.b.clientExt), {
+        bizType: 'listenTogether', ltType: 'FRIEND', roomId: 'r1',
+      });
+      assert.deepStrictEqual(JSON.parse(c.b.msgBody), { msg: 'hi', msgType: 0 });
+    });
+});
+test('sendToRoom 缺 chatroomId 时明确报错', function () {
+  const ms = new message.MessageService({ eapiRequest: function () { return Promise.resolve({}); } });
+  return ms.sendToRoom({ text: 'hi' }).then(
+    function () { throw new Error('应当拒绝'); },
+    function (e) { assert.ok(/chatroomId/.test(e.message)); },
+  );
 });
 
 /* --------------------------------------------------------------- 汇总 */

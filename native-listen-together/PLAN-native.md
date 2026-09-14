@@ -1,12 +1,18 @@
-# 网易云「原生一起听」改造计划书 v0.3
+# 网易云「原生一起听」改造计划书 v0.4
 
 > 交付给第三方开发者实施。**本计划书与参考代码均未改动 `netease-listen/` 任何文件。**
 >
 > 参考代码在 `reference/`，自检通过 **49/49**，并已用真实 cookie 完成端到端实测
 > （建房 → 邀请 → 真人加入 → 双向同步 → 关房，全流程跑通）。
 >
-> **v0.3 关键更新**：加歌能力的根因已**实测定位**（见 3.4）——
-> 不是权限、不是载荷格式，而是**不在 HTTP 层**。产品方案已相应调整。
+> **v0.4 关键更新（重大突破，全部经双账号真机实测）**：
+> 1. **加歌 / 换整个歌单** ✅ 已跑通 —— v0.3 判定的"不在 HTTP 层"**被推翻**（见 3.4）
+> 2. **AI 切歌 → 真人官方客户端实时跟随** ✅ 已验证
+> 3. **房间内发言** ✅ 已跑通 —— v0.3 判定的"走云信长连接够不着"**被推翻**（见 3.5）
+> 4. **`playCommand` 读取路径**修正（旧代码读错位置，见 3.4）
+>
+> v0.3 的两个"否定性结论"都被证伪，教训已记录在 3.4「历史教训」一节：
+> **遇到"接口存在但写入不生效"，先抓一次官方客户端的真实请求，不要继续黑盒穷举。**
 
 ---
 
@@ -136,116 +142,131 @@ data.playlist.version = [{ userId, version, outerId }]
 
 **结论：轮询方案成立，无需集成 Agora 原生依赖。**
 
-### 3.4 仍未跑通的部分：⚠️ 加歌（ADD）**
+### 3.4 ✅ 加歌 / 换歌单 / 切歌 —— 全部跑通（v0.4 重大突破）
 
 | 项目 | 状态 |
 |---|---|
 | 切歌 GOTO / NEXT / PREV | ✅ 已跑通 |
 | 播放 / 暂停 PLAY / PAUSE | ✅ 已跑通（`playStatus` 真实翻转） |
 | 读播放列表 | ✅ 已跑通 |
-| **加歌进房间列表** | ❌ **尚未跑通** |
+| **加歌进房间列表** | ✅ **已跑通（v0.4 新增）** |
+| **整单替换（换歌单）** | ✅ **已跑通（v0.4 新增）** |
+| **AI 切歌 → 真人客户端实时跟随** | ✅ **已跑通（v0.4 新增）** |
 
-试过的形态（全部**未生效**）：
+> **v0.3 曾判定「加歌不在 HTTP 层」——该结论已被推翻。**
+> 加歌**就是** HTTP 的 `sync/list/command/report`，此前失败纯粹是
+> **载荷字段形态错误**（用了 `operationType:'ADD'` 增量语义）。
+> 详见下方「破解过程」。
 
-```
-{ operationType:'ADD', songIds:[id] }                  -> result:true，列表不变
-{ operationType:'ADD', songId:id }                     -> result:true，列表不变
-{ operationType:'ADD_SONG' } / { operationType:'INSERT' } -> result:true，列表不变
-{ operationType:'ADD', displayList:{result:[...]} }    -> result:false（被拒）
-带 version 数组的 displayList 形态                       -> result:false（被拒）
-```
+#### 🔑 正确的载荷形态（照抄官方客户端抓包）
 
-**推测**：房间列表变更依赖 `playlist.version` 的**每用户版本协商（乐观锁）**，
-必须带上正确的 version 才可能被接受。需要**抓一次官方客户端加歌的完整请求**来确定。
+**加歌 / 换歌单 —— `sync/list/command/report`，明文表单（不要用 `params=` 加密）：**
 
-#### ⚠️ 原 MCP 的 `add_song` 很可能从未被真正验证过
-
-上游 README / 代码注释都写着：
-
-> 加歌了但 APP 看不到 —— **正常，清后台重进**
-> 「加完对方要清一次 APP 后台重进才能看到新列表」
-
-**本次实测：用原 MCP 的 `addSongs()` 原样调用，服务端返回
-`{"result":true}`，但反复抓 `playlist/get` 十几秒，列表长度恒定不变，
-新歌 ID 从未出现。** 也就是说，这条注释描述的"清后台重进就能看到"
-**无法复现** —— 更像是**用客户端重启的假象掩盖了一个没生效的写操作**。
-
-> 结论：上游的加歌能力**应按「未实现」对待**，不能作为本方案的基础。
-> 谁要基于它做「AI 点歌」，必须先自己双账号验证一次。
-
-#### 决定性证据：加歌写入被服务端**完全忽略**
-
-在**对方客户端关闭后台**的窗口期重测（排除"客户端缓存"这个解释），
-并对加歌前后的 `playlist/get` 做**逐字段 diff**：
-
-```
-写前: operationType:'ADD', songIds:['186016']
-resp: {"result":true,"message":""}          <- 假成功
-写后 4 秒，逐字段对比:
-  (完全没有字段变化 —— 服务端彻底忽略了这次写)
+```json
+{
+  "commandType": "REPLACE",
+  "displayList": ["...原列表全部歌曲...", "...新加的歌..."],
+  "anchorPosition": 2,
+  "anchorSongId": "3395220104",
+  "clientSeq": 1789389529015,
+  "randomList": [],
+  "version": [{"userId": 10000000002, "version": 10}]
+}
 ```
 
-**注意**：连我自己的 `version` 条目都**没有从 1 递增**。
-如果写入真的被受理，我的版本号必然推进。这直接证明
-**服务端根本没处理这个请求**，`result:true` 是纯伪造的成功码。
+**切歌 —— `play/command/report`，明文表单：**
 
-**排除的替代解释**：
+```json
+{
+  "clientSeq": 1789390650760,
+  "commandType": "GOTO",
+  "formerSongId": "30431371",
+  "playStatus": "PLAY",
+  "progress": 0,
+  "serverSeq": 1789390572195,
+  "targetSongId": "29753852",
+  "triggerType": "MANUAL",
+  "userId": 10000000001
+}
+```
 
-| 解释 | 是否成立 | 依据 |
+**表单字段名**：`roomId` + `playlistParam`（列表命令）/ `commandInfo`（播放命令），
+值为**上述 JSON 的字符串**，整体以**明文 FormBody** 提交。
+
+#### 与旧实现的四个关键差异（这就是全部根因）
+
+| 字段 | 旧实现（❌ 失败） | 官方抓包（✅ 成功） |
 |---|---|---|
-| 客户端缓存导致看不到 | ❌ 排除 | 关后台 + 逐字段 diff 仍无变化 |
-| 需要重启客户端才拉取 | ❌ 排除 | 服务端数据本身就没变，重启也拉不到 |
-| `version` 协商不对 | ❌ 排除 | 穷举 20+ 种 version 组合全部 `result:false` 或无效 |
-| 需要换端点 | ❌ 排除 | 探测 30+ 候选端点全部 404 |
-| 需要换 `commandType` | ❌ 排除 | `play/command/report` 试 11 种 ADD 类 commandType 全部无效 |
+| `commandType` | `ADD`（增量语义） | **`REPLACE`**（全量替换） |
+| `displayList` | **只放新歌** | **完整列表**（原列表 + 新歌） |
+| `anchorPosition` / `anchorSongId` | 缺失 | **必须带上** |
+| `version` | 缺失 / 盲目穷举 | **取服务端现值 +1，随请求回传** |
+| 编码 | 曾试 `params=` 加密 | **明文表单**即被接受 |
 
-**唯一残留可能**：加歌走**云信 IM 长连接**（与房间聊天同一条通道），
-不在 HTTP 层。这也解释了为什么房间聊天和加歌**同时都够不着**。
+> **一句话**：房间列表没有"加一首"的语义，只有
+> **「用一份完整列表替换掉旧的」**。想加歌 = 读当前列表 → 追加 → 整份 REPLACE 回去。
 
-#### 🔑 真正的根因：**列表变更不是普通写接口**（已定位，附决定性证据）
+#### 下游读取的关键坑：`playCommand` 不在 `playlist` 里
 
-**先说结论**：加歌不是"权限"问题，也不是"载荷写错"问题。
-真人客户端确实能改列表（实测 1→18 首、3→23→365 首），
-但**同一条 HTTP 接口在服务端被完全忽略** —— 无论谁调用、什么身份。
-
-**实测对比**：
-
-| 调用方 | 身份 | 结果 |
-|---|---|---|
-| 真人官方客户端 | 房主 | ✅ 列表 3→23→365 |
-| 真人官方客户端 | **加入者** | ✅ 列表 1→18（**证明与房主权限无关**） |
-| 本项目 HTTP（eapi） | 房主 | ❌ `result:true` 但无任何变化 |
-| 本项目 HTTP（weapi） | 房主 | ❌ 同上 |
-| 本项目 HTTP（eapi） | 加入者 | ❌ 同上 |
-
-> 早前"只有房主能改"的假设**已被推翻** —— 真人以加入者身份也能改。
-> 真正的区别是**调用通道**，不是身份。
-
-**决定性证据**：加歌前后对 `playlist/get` 做**逐字段 diff**，
-**没有任何字段变化**，连调用者自己的 `version` 都不递增：
+`playlist/get` 的响应结构是：
 
 ```
-写前: operationType:'ADD', songIds:['186016']
-resp: {"result":true,"message":""}      <- 假成功
-写后逐字段对比: (完全没有字段变化)
+data.playCommand   <- 播放指令在这里（旧代码读错成 data.playlist.playCommand，永远是 undefined）
+data.playlist      <- displayList / version / playMode ...
 ```
 
-**排除的解释**（全部实测）：
+这一点曾导致"切歌成功但读不到"的误判。**旧实现的 `current()` 必须修正。**
 
-| 解释 | 结论 | 依据 |
+#### 破解过程（方法可复用）
+
+v0.3 的结论建立在**纯 HTTP 黑盒爆破**上（318 端点 + 40 余种载荷形态），
+全部失败。v0.4 换用 **Frida 动态抓包**（root 真机 + `frida-server` 16.7.19）
+后一次定位，关键经验：
+
+1. **Frida 17+ 已移除内置 Java bridge**，必须用 **16.x**，否则 `Java is not defined`。
+2. **hook 点选 `okhttp3.Request$Builder.build`** 即可拿到**请求明文** ——
+   网易云的 eapi 拦截器会**先用明文 FormBody 构造请求、再由拦截器加密成 `params=`**，
+   因此 `build()` 会被调用两次，**两次都能抓到，明文那次就是真实载荷**。
+3. **不要同时 hook 太多点**：实测同时挂 `APICryptor` + okhttp + libc 时
+   agent 会在 ~2 秒内被销毁（`script has been destroyed`，疑为反调试），
+   **单独挂 okhttp 完全稳定**。
+4. `javax.crypto.Cipher.doFinal` 全程**零命中** —— 请求加密走 **native**
+   （`libcaesar.so` 的 `Java_..._APICryptor_native_1encrypt_1m`），
+   hook Java 加密层是**无效方向**，不要在这上面浪费时间。
+
+#### 实测验证记录（v0.4，双账号真机）
+
+| 动作 | 发起方 | 结果 |
 |---|---|---|
-| 载荷格式错 | ❌ | 穷举 40+ 种形态，含 `displayList` 全量/增量/`replace`/`version` 协商 |
-| 权限（非房主） | ❌ | 真人加入者也能改；房主身份下我依然失败 |
-| 端点找错 | ❌ | **爆破 318 + 第二轮候选，只有 3 个端点存在** |
-| 通道错（eapi/weapi） | ❌ | 两条通道都试过 |
-| 客户端缓存 | ❌ | 关后台 + 逐字段 diff 仍无变化 |
-| 缺 `version` 条目 | ❌ | 空/原样/递增/含自己/缺字段全试过 |
-| `outerId` 不对称 | ❌ | `null`/`""`/随机值全试过 |
-| 需要 `songIdWithAlgList` | ❌ | 数组/对象形态均无效 |
+| 加 2 首（孤勇者 / 起风了） | AI 号（柠檬汁） | ✅ 15 → 17 首，曲目详情核对无误 |
+| 整单替换为「喜欢的音乐」 | AI 号 | ✅ 17 → **77 首**，**真人客户端刷新手看到** |
+| GOTO 到列表第 21 首 | AI 号 | ✅ 服务端 `targetSongId` 更新，`userId`=AI 号 |
+| **真人客户端跟随** | — | ✅ **真人手机实时切到 AI 指定的歌（用户确认）** |
 
-**结论**：列表变更**不在 HTTP 层**。它要么走**云信 IM 长连接**
-（与房间聊天同一条通道 —— 这解释了为什么两者同时够不着），
-要么依赖某个**客户端专有的一次性凭证**。
+> 这三条合起来意味着：**模式 2 / 模式 3 的「AI 点歌」完全可行**，
+> 不再需要"加歌必须由真人操作"的降级方案。
+
+#### 历史教训：为什么 v0.3 会得出错误结论（值得记录）
+
+v0.3 判定「加歌不在 HTTP 层」，现在回看，**每一步推理都踩在假象上**，
+把这段留下来是为了避免后来者重走：
+
+| 当年的观察 | 真实原因 |
+|---|---|
+| 发 `operationType:'ADD'` 返回 `result:true` 但列表不变 | 该接口对**无法解析的载荷也回 `result:true`**，属"假成功"；正确语义是 `REPLACE` 全量替换 |
+| 连自己的 `version` 都不递增 | 因为服务端**确实没受理** —— 载荷字段名/语义就是错的 |
+| 穷举 40+ 形态全失败 | 穷举的是 `operationType` 家族，**从未试过 `commandType:'REPLACE'` + 全量 `displayList`** |
+| 爆破 318 端点只有 3 个存在 | 端点本来就找对了（就是 `sync/list/command/report`），**错的是载荷** |
+| 上游 MCP `add_song` 也无效 | 上游用的是同一套错误载荷，**它确实从未被真正验证过** |
+| 真人客户端能改、我不能改 | 与权限无关；真人客户端发的是**正确的 REPLACE 载荷** |
+
+**核心教训**：`result:true` 在这个接口上**完全不可信**，
+不能用它判断写入是否被受理。**唯一的判据是回读 `playlist/get` 做逐字段 diff。**
+
+**方法论教训**：纯黑盒爆破在"载荷语义未知"时会陷入
+「形态穷举 → 假成功 → 误判为通道问题」的死循环。
+本次是靠 **Frida 抓官方客户端真实请求**一跳出坑 ——
+**遇到"接口存在但写入不生效"，优先抓一次官方客户端的真实请求，而不是继续穷举。**
 
 #### 三个同类开源项目交叉验证（均未解决加歌）
 
@@ -259,23 +280,23 @@ resp: {"result":true,"message":""}      <- 假成功
 
 - 邀请在私信收件箱、`type:23`、`generalMsg.nativeUrl`、**要 `decodeURIComponent` 两次**
   → 与本项目 `invite.js` 的发现**完全一致**，交叉印证。
-- **房间聊天明确放弃**：「那是网易云信（NIM）的长连接私有协议，
-  只在手机 app 里跑，HTTP 接口够不着。我们查清楚了，明确不做。」
-  → 与本项目探测 23 个端点全 404 的结论**完全一致**。
 - 心跳**接口名拼错**为 `heatbeat`（源码注释特别标注）。
 - 对方关房时心跳返回 **488**（= 已由对方结束）→ 应清空本地 roomId 重找邀请。
   **这是本项目尚未覆盖的边界情况，建议补进 `sync.js`。**
 - 换歌回调**节流 90 秒**，避免 AI 每首都说话。**同样值得借鉴。**
+- ~~「房间聊天是网易云信私有长连接，HTTP 够不着」~~
+  → **本项目 v0.4 已推翻**：房间聊天走 **HTTP** 的
+  `POST /api/middle/im/chatroom/send`（见 3.5），并非够不着。
+  该团队的"明确不做"结论**至少对聊天这一项是错的**。
 
-**三个仓库对「加歌」用的是同一个载荷**（`operationType` + `songIds` +
-`clientSeq`/`clientTime`），**没有任何一个提供了可用的实现**。
-本次对 20+ 种载荷形态的穷举全部失败，可以认为：
-**加歌不在 HTTP 层，或者需要 `playlist.version` 的精确协商，目前无公开解。**
+**三个仓库对「加歌」用的是同一个错误载荷**（`operationType` + `songIds`），
+所以**没有任何一个提供了可用实现** —— 这不是"行业难题"，
+而是**大家都没去抓一次官方客户端的真实请求**。
+v0.4 已给出可用解（见本节开头）。
 
-**产品结论（重要，已实测确认）**：模式 2/3 的「AI 点歌」应改为
-**「AI 在房间已有列表里 GOTO 切歌」**，而不是「AI 往列表里加新歌」。
+#### 旧版「GOTO 到列表外的歌可顺带加歌」的说明
 
-实测验证（本回合）：
+早期记录过：
 
 ```
 A) GOTO 到【列表内】的歌 -> target 变了  ★切歌成功
@@ -283,40 +304,46 @@ B) GOTO 到【列表外】的歌 -> target 不变  （被静默拒绝，但返�
 C) NEXT / PAUSE         -> 生效，serverSeq 推进
 ```
 
-**注意 B**：GOTO 一首不在列表里的歌**不会**把它加进去，
-只是**静默失败**（`result:true` 但 target 不变）。
-所以"用 GOTO 顺带加歌"这条路也堵死。
+**B 依然成立**：`play/command/report` 的 GOTO **不会**把列表外的歌加进去。
+但现在这**不再是限制** —— 想加歌就调 `sync/list/command/report` 的
+`REPLACE`（见本节开头），两者是**不同接口、各司其职**：
 
-**最终方案**：AI 只能在房间已有列表内切歌；「加歌/换歌单」
-必须由**真人侧在自己客户端操作** —— 真人做完后，AI 通过轮询
-`playlist/get` **立刻能看到**（实测 1→18 首被实时观测到）。
-
+- **改列表** → `sync/list/command/report`（`playlistParam`, `commandType:'REPLACE'`）
+- **改播放** → `play/command/report`（`commandInfo`, `commandType:'GOTO'/'NEXT'/'PAUSE'`）
 
 
-**为什么这条注释能长期存在**：`sync/list/command/report` 对错误载荷
-返回 `result:true`（假成功），且列表变更本来就需要真人客户端重启才刷新——
-「操作没生效」和「需要重启」两种解释在**单人测试**下无法区分。
+### 3.5 ✅ 私信收发可行 / ✅ 房间内**发**言可行（读不可行）
 
+> **v0.4 修正**：v0.3 曾判定「房间内聊天没有 HTTP 接口，走云信长连接」——
+> **该结论错误**。Frida 抓包显示房间聊天**就是 HTTP**，只是端点名字
+> 不在 `listen/together/*` 命名空间下，所以早期按关键词爆破全部 404。
 
-
-> **替代方案**：模式 2/3 下，AI 可只用 **GOTO 切到房间已有的歌**；
-> 若需要"AI 点任意新歌"，可让"加歌"动作由**真人侧在客户端完成**，
-> 或等抓包确定 version 语义后补齐。
-
-### 3.5 ✅ 私信收发可行 / ❌ 房间内聊天不可行（实测）
-
-**探测结论**：房间内聊天**没有 HTTP 接口**。试了 23 个候选端点，**全部 404**：
+**房间内发言（✅ 可用，明文表单）：**
 
 ```
-/api/listen/together/chat/{get,list,send}
-/api/listen/together/message/{get,list,send}
-/api/chatroom/{get,members,message/send,message/get,history}
-/api/msg/chatroom/send ...
+POST https://interface3.music.163.com/api/middle/im/chatroom/send
+  chatroomId = 123456789                      <- 取自 roomInfo.chatRoomId
+  msgType    = 0
+  clientExt  = {"bizType":"listenTogether","ltType":"FRIEND","roomId":"<roomId>"}
+  msgBody    = {"msg":"要说的内容","msgType":0}
 ```
 
-原因：`roomInfo.roomRTCType === "yunxin"` —— 房间内的文字/语音消息走
-**网易云信 IM 长连接**，不是 HTTP。插件里想做「房间内发言」，
-要么集成云信 SDK，要么放弃。
+实测返回 `{"code":200,"data":{"result":true,...}}`，**真人客户端可见**。
+
+> **注意**：`roomInfo.roomRTCType === "yunxin"` 只表示**房间基于云信通道**，
+> **不代表消息只能走云信私有协议**。服务端提供了 HTTP 转发入口。
+> 这是本项目推翻的第二个"看起来像定论"的结论。
+
+**❌ 但「读」房间聊天历史仍无解**：`/api/middle/im/chatroom/{history,messages,get}`
+与 `/api/chatroom/message/get` **全部 404**。也就是说：
+
+- **AI → 房间发言**：✅ 可以（上面那条）
+- **读房间里的聊天**：❌ 不行（要读只能集成云信 SDK）
+
+**对本项目的实际影响（重要）**：
+模式 2/3 里 AI 要"听真人说了什么"，**不能靠读房间聊天**，
+只能靠**私信**（`/api/msg/private/*`，读写都通）或**房间状态变化**
+（`playCommand` / `displayList` 轮询）。**产品设计必须按这个约束来。**
 
 **但私信是纯 HTTP 的，且实测收发都通**：
 
@@ -407,7 +434,10 @@ AI 想对真人说句话、状态通知。**这是模式 2/3 里 AI 与真人唯
 8) 下行      playlist/get 非空；对方切歌 serverSeq 推进 ✓
 9) 上行      暂停/播放/下一曲 -> playStatus 真实翻转 ✓
 10) 私信     发 code=200 对方收到；收 双向历史可读 ✓
-11) 加歌     playlistParam 各种形态均 result:false ✗（见 3.4）
+11) 加歌     REPLACE + 全量 displayList -> 15→17 首 ✓（v0.4）
+12) 换歌单   REPLACE 整单 -> 17→77 首，真人客户端刷新可见 ✓（v0.4）
+13) 切歌     GOTO -> targetSongId 更新，真人手机实时跟随 ✓（v0.4）
+14) 房间发言 /api/middle/im/chatroom/send -> code=200，真人可见 ✓（v0.4）
 ```
 
 **运行自检**：
@@ -461,7 +491,9 @@ netease-listen/
 | `native_join` | 接受邀请进房 |
 | `native_status` | 房间成员 + 在房状态 |
 | `native_play` | 上报切歌 |
-| `native_add_song` | 加歌进房间列表 |
+| `native_add_song` | 加歌进房间列表（`REPLACE` 全量语义，v0.4 已可用） |
+| `native_replace_playlist` | 整单替换（换歌单），v0.4 新增 |
+| `native_say_in_room` | 在房间里发一条文字消息，v0.4 新增 |
 | `list_invites` | 从私信里解析邀请 |
 | `accept_invite` | 接受指定邀请 |
 | `native_end` | 关房 |
@@ -473,7 +505,7 @@ netease-listen/
 | 本地操作（真人在 webview / AI 决策） | 进**单写入队列**串行执行 → 更新本地 state → 节流上报 |
 | 轮询发现远端变更 | 覆盖本地 state → SSE 广播 |
 | **刚上报过（1.5s 内）** | **忽略远端**，防止"自己刚切完歌又被旧状态打回来"的抖动 |
-| 加歌幂等 | 已在 `_knownSongIds` 则跳过，避免重复 ADD |
+| 加歌幂等 | 已在当前列表则跳过；**写前必须重读列表**（`REPLACE` 是全量覆盖，读到旧列表会冲掉真人的新歌） |
 | 节流 | 非结构性操作 3s 内不重复上报，降低风控概率 |
 
 ---
@@ -501,11 +533,12 @@ netease-listen/
 
 | 风险 | 等级 | 说明与对策 |
 |---|---|---|
-| ~~下行无法观测~~ | ✅ 已排除 | 实测可行；**但加歌 ADD 仍未跑通**（见 3.4） |
-| **加歌无解** | 🟠 中高 | 见 3.4；三个同类项目均未解决。**方案改为"AI 只 GOTO 房间已有歌"**，加歌由真人侧完成 |
-| **手机抓包不可行** | 🟡 中 | 证书绑定（cert pinning）+ 无 root → 无法抓官方客户端请求。**指望抓包解加歌的路已断** |
+| ~~下行无法观测~~ | ✅ 已排除 | 实测可行（`data.playCommand` + `displayList`） |
+| ~~加歌无解~~ | ✅ **v0.4 已解决** | 正确载荷为 `commandType:'REPLACE'` + 全量 `displayList`（见 3.4），双账号实测通过 |
+| ~~手机抓包不可行~~ | ✅ **v0.4 已解决** | **root 真机 + Frida 16.7.19 hook `okhttp3.Request$Builder.build`** 即可拿到请求明文，无需解证书绑定（见 3.4「破解过程」） |
 | **cookie 泄露** | 🔴 高 | 两个真实凭证落盘。必须 0600 + `credentials/` 进 gitignore + 脱敏回显 |
-| **风控/封号** | 🔴 高 | 逆向协议高频调用有风险，aicookie 又是新号。对策：限频、可一键关闭、轮询取 2–3s 而非 1s |
+| **风控/封号** | 🔴 高 | 逆向协议高频调用有风险，aicookie 又是新号。对策：限频、可一键关闭、轮询取 2–3s 而非 1s。**注意 `REPLACE` 是整单覆盖，误发会清空真人歌单，务必先读后写** |
+| **整单替换的破坏性** | 🟠 中 | `REPLACE` 语义是**全量覆盖**：若读到的列表已过期，会把真人的新歌冲掉。对策：每次写前**立即重读一次**，写完回读校验；AI 只做追加，不做删除 |
 | **模式 1 回归** | 🟡 中 | 改造面大，必须保住现有 17 个工具行为不变；建议加回归测试 |
 | **Agora 无法集成** | 🟡 中 | 若必须实时，需引入原生依赖，与零依赖冲突，需重新评估 |
 | **心跳断则掉线** | 🟡 中 | 需要进程守护/自动重连；心跳间隔建议 25s |
@@ -518,10 +551,12 @@ netease-listen/
 1. ✅ ~~双账号同房时 `playlist/get` 是否非空~~ **已验证：非空**
 2. 🔴 **真人建房后，邀请链接的生成方式**（实测的是 AI 建房；"真人建房邀请 AI"这条路径待抓包）
 3. ✅ ~~真人切歌时 AI 能否观测到~~ **已验证：能**（`serverSeq` + `targetSongId`）
-3b. 🔴 **加歌 ADD 的正确载荷（含 version 语义）** —— 唯一未跑通项
-4. 🟡 `status/get` 的 `anotherDeviceInfo` / `anotherFollowStatus` 语义（疑似同账号多端跟随，非房间内同步）
-5. 🟡 直播/一起听是否存在**独立的 push 通道**（WebSocket / 长轮询 CDN 地址）
-6. 🟡 建议抓一次**官方 App 的真实一起听会话**（Android 抓包），可一举确定 3–5
+4. ✅ ~~加歌的正确载荷（含 version 语义）~~ **v0.4 已解决**，见 3.4
+5. ✅ ~~房间内聊天能否走 HTTP~~ **已验证：能发不能读**，见 3.5
+6. 🟡 `status/get` 的 `anotherDeviceInfo` / `anotherFollowStatus` 语义（疑似同账号多端跟随，非房间内同步）
+7. 🟡 **读房间聊天历史**（v0.4 确认无 HTTP 接口，需云信 SDK）—— 若 AI 必须"听懂"真人发言才需要
+8. 🟡 `REPLACE` 的**并发语义**：两个成员同时改列表时，服务端如何合并/冲突？`version` 是否是乐观锁？
+9. 🟡 直播/一起听是否存在**独立的 push 通道**（WebSocket / 长轮询 CDN 地址）—— 若有可替代轮询，降低延迟与风控
 
 ---
 
@@ -542,6 +577,74 @@ netease-listen/
 `invitation/list`、`play/invitation/list`、`play/invitation/reject`、`play/invitation/send`、
 `create`、`playlist/get`
 
+### 10.1 抓包实录：`middle/im` 与 `listen/together` 的真实端点
+
+**本次 Frida 抓包新发现的端点**（早期关键词爆破全部漏掉）：
+
+| 端点 | 方法 | 作用 |
+|---|---|---|
+| `/api/middle/im/chatroom/send` | POST | **房间内发言**（明文表单） |
+| `/eapi/listen/together/heartbeat` | POST | 心跳（含 `playlistVersion`） |
+| `/eapi/listen/together/privilege/get` | POST | 权限查询 |
+| `/eapi/listen/together/common/liked/song/report` | POST | 红心上报 |
+| `/eapi/listen/together/relation/statistics/get/v2` | POST | 一起听统计 |
+| `/eapi/listen/together/user/gps/report` | POST | 位置上报 |
+
+> **教训**：早期按 `listen|together|playlist` 关键词做 URL 过滤，
+> 直接漏掉了 `middle/im/chatroom/*`。**爆破命名空间不如抓一次真实请求。**
+
+### 10.2 复现抓包的最短路径（root 真机 + Frida）
+
+给后来者的**可复用操作手册**：
+
+```bash
+# 1) 装 Frida 16（⚠️ 17+ 已移除 Java bridge，会报 'Java' is not defined）
+pip3 install --break-system-packages "frida==16.7.19" "frida-tools<14"
+
+# 2) 推 frida-server 16 到手机（需 root）
+adb push frida-server-16.7.19-android-arm64 /data/local/tmp/frida-server16
+adb shell "su -c 'chmod 755 /data/local/tmp/frida-server16; /data/local/tmp/frida-server16 &'"
+
+# 3) frida-server 只监听 127.0.0.1，必须走 adb forward
+adb forward tcp:27042 tcp:27042
+
+# 4) attach 到**已在运行**的进程（不要 spawn，会打断真人的房间）
+#    脚本核心只有 20 行：
+```
+
+```js
+Java.perform(function () {
+  var RB = Java.use('okhttp3.Request$Builder');
+  RB.build.implementation = function () {
+    var req = this.build();
+    var u = req.url().toString();
+    if (u.indexOf('163.com') === -1) return req;
+    var b = req.body();
+    if (b && b.getClass().getName().indexOf('FormBody') !== -1) {
+      var fb = Java.cast(b, Java.use('okhttp3.FormBody'));
+      var out = [];
+      for (var i = 0; i < fb.size(); i++) out.push(fb.name(i) + '=' + fb.value(i));
+      send(req.method() + ' ' + u + '\n  ' + out.join(' & '));
+    }
+    return req;
+  };
+});
+```
+
+**五个必须知道的坑（本次踩过）**：
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| Frida 17 | `ReferenceError: 'Java' is not defined` | 降到 **16.7.19**（客户端与服务端版本要一致） |
+| 同时 hook 多个点 | agent 约 2 秒后 `script has been destroyed`（疑反调试） | **一次只 hook 一个点**；单独 hook okhttp 完全稳定 |
+| hook `Cipher.doFinal` | 全程零命中 | 请求加密走 **native**（`libcaesar.so`），**不要**在 Java 加密层浪费时间 |
+| 只 hook `Request$Builder.build` 之外 | 拿不到明文 | eapi 拦截器会**先用明文 FormBody 建一次、再加密成 `params=` 重建**，`build()` 被调用两次，**明文那次就是真实载荷** |
+| 用 `head`/管道看输出 | 看不到日志（缓冲） | 直接写文件 + `tail -f`，或让 hook 结果落盘再读 |
+
+**Frida 是否可被检测**：网易云 9.3.85 **没有**主动反 Frida 的硬检测
+（纯心跳脚本可长期存活），但**同时挂多个 hook 会触发异常**。
+纯真机 root + attach 的模式，本项目实测**稳定可用**。
+
 ---
 
 ## 11. 许可证与来源
@@ -553,4 +656,5 @@ netease-listen/
 
 ---
 
-**计划书结束。** 实施前请先完成 **P0**（第 3.3 节的假设验证）——它决定模式 2/3 是否成立。
+**计划书结束。** v0.4 已打通全部核心能力（建房 / 邀请 / 加歌 / 换歌单 / 切歌 / 房间发言），
+实施时请以 **3.4 节抓包得到的载荷形态**为准，不要再用旧的 `operationType:ADD`。
