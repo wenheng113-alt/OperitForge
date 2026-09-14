@@ -1,3 +1,3 @@
 # OperitForge
 
-This repository stores release assets published from Operit.
+This repository stores release assets published from Operit
