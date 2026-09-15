@@ -959,10 +959,20 @@ const server = http.createServer(async (req, res) => {
      * 原生驱动不翻译这些，必须始终走本地分支，
      * 否则 solo_ai / duo 模式下会被 native default 静默吞掉（心跳被丢 → 进度不校准）。 */
     const LOCAL_ONLY_ACTIONS = ['heartbeat', 'setmeta', 'setmode', 'refreshurl'];
+    /* P8 双写动作：既要转发原生（让同房好友同步），又必须本地同步落地。
+     * next/prev：本地 switch 有完整切歌实现，但 solo_ai 单人房没有远端 playCommand
+     * 回灌（NEXT/PREV 指令不带 songId，_pullRemote 命中 `if(!cmd)return null` 直接返回），
+     * 若只转发不落地，本地 state.song 永不推进 → 切歌彻底失效。故转发后继续走本地逻辑。 */
+    const DUAL_WRITE_ACTIONS = ['next', 'prev'];
     if (state.mode && state.mode !== 'local' && LOCAL_ONLY_ACTIONS.indexOf(b && b.action) < 0) {
       try {
         const r = await nativeDriver.handleControl(b);
-        return json(res, 200, r);
+        /* 纯原生动作：原生驱动负责翻译+下发，转发即完成，直接返回 */
+        if (DUAL_WRITE_ACTIONS.indexOf(b && b.action) < 0) {
+          return json(res, 200, r);
+        }
+        /* 双写动作：转发结果不阻塞，继续走下方本地逻辑让 state 立即生效（原生转发失败也不影响本机切歌） */
+        state.native.lastForward = r;
       } catch (e) {
         state.native.lastError = String((e && e.message) || e);
         console.log('[LT] native control error, fallback to local:', state.native.lastError);
