@@ -555,25 +555,28 @@ function createDriver() {
        * （这解释了"房间 target 变了但 APP 不切"）。改用**秒级**时间戳(~1.79e9)，
        * 既在 int 范围内、又保持单调递增。 */
       const _clientSeq = Math.floor(_seqNow / 1000);
-      /* P9r: 关键 —— 指令要以「用户(human)身份」下发。
-       * 实测：用 ai cookie 下发时，服务端广播的 20000 消息 sender/sendUid = AI(10000000001)，
-       * APP 看到是"对方发来的"→ 失焦/后台时只缓存不执行（u0.v0 的 audio-focus gating）。
-       * 改用 human cookie 下发后，服务端广播 sender/sendUid = human(10000000002)，
-       * APP 视为"我自己操作的"→ 直接执行。故这里优先 human 身份，无 human cookie 才回退 ai。 */
+      /* P9y【根因确认·实测验证】指令必须以「用户(human)身份」下发。
+       * 对照实验铁证（真人 APP 前台）：
+       *   - AI 身份(sendUid=10000000001) 发 GOTO → APP 只弹"对方切歌了"提示，**歌不切**；
+       *   - human 身份(sendUid=10000000002) 发 GOTO → APP **真的切歌**（素颜 167827）。
+       * 原因：APP 的 u0.v0() 判定 PlayCommand.getUserId()(=sendUid)：
+       *   - 若 != 本机登录 uid → 视为"对方发来的"→ 走「提示」路径，且失焦时仅缓存不执行；
+       *   - 若 == 本机登录 uid → 视为"我自己操作的"→ 走正常执行路径，真正切歌。
+       * 故必须用 human cookie 下发（human 就是 APP 上登录的账号），无 human cookie 才回退 ai。 */
       const _humanUid = (status.accounts && status.accounts.human && Number(status.accounts.human.userId)) || 0;
       let _hasHuman = false;
       try { _hasHuman = !!identity.readCookie('human'); } catch (e) {}
-      /* P9s-fix: 一律以 AI 身份下发。APP 端 u0.v0() 用 PlayCommand.getUserId()(=sendUid) 判定：
-       *   失焦态下 sendUid==自己 → 直接丢弃；sendUid!=自己 → 缓存，回前台/恢复焦点时重放。
-       * 故 human 身份在 APP 后台时会被丢弃（P9r 的错误方向），必须用 AI 身份。 */
-      const _sendWho = 'ai';
+      /* ⚠️ 只要 human cookie 存在就用 human 下发 —— 服务端广播的 sendUid 由 cookie 决定，
+       * APP 读的正是广播 sendUid（PlayCommandMsg: setUserId(content.getLong("sendUid"))），
+       * 与我们传的 userId 字段无关。故此处不依赖 accounts 是否已加载（避免时序竞态）。 */
+      const _sendWho = _hasHuman ? 'human' : 'ai';
       const cmd = {
         clientSeq: _clientSeq,
         /* P9j: 完全对齐官方抓包字段（无 clientTime / ignoreUserId）。
          * serverSeq 必须回填**房间当前值**，否则 APP 可能认为指令不对应当前房间状态。 */
         serverSeq: (status.lastRemote && Number(status.lastRemote.serverSeq)) || 0,
         triggerType: 'MANUAL',
-        userId: status.creatorId || undefined,
+        userId: (_sendWho === 'human' && _humanUid) ? _humanUid : (status.creatorId || undefined),
       };
       let targetSongId = curSongId;
       let progress = curPos;
