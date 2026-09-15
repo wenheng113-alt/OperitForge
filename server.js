@@ -493,8 +493,12 @@ _roomWatchTimer = setInterval(function () { tryStartRoomWatch(); roomWatchTick()
 if (_roomWatchTimer.unref) _roomWatchTimer.unref();
 
 /* P9b: 把「AI 点歌」推送到网易云房间（AI 操控 APP 切歌）。
- * ⚠️ 顺序坑（实测）：必须先 addSongs 并**等它真正生效**（REPLACE 有 3–5s 服务端传播延迟），
- *    再下发 GOTO；否则 GOTO 指向一首「还不在房间里」的歌会被服务端忽略。 */
+ * ⚠️ 两个实测坑：
+ *   ① 顺序：必须先 addSongs 并**等它真正生效**（REPLACE 有 3–5s 服务端传播延迟），
+ *      否则 GOTO 指向一首「还不在房间里」的歌会被忽略。
+ *   ② 指令信封：**不能**直接调 ltapi.reportCommand（缺 clientSeq/triggerType/userId，
+ *      发出去 clientSeq=0、triggerType=null，APP 端按 clientSeq 去重会当成「已处理」直接忽略）。
+ *      必须走 /control 的 load 动作，由 driver.handleControl 补全信封字段。 */
 function pushSongToRoom(songId, opts) {
   const o = opts || {};
   let ds = {};
@@ -506,19 +510,19 @@ function pushSongToRoom(songId, opts) {
   ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 6, verifyDelayMs: 1500 })
     .then(function (r) {
       console.log('[song→room] addSongs ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
-      /* 等列表传播稳定后再下发播放指令 */
+      /* 等列表传播稳定后，再经 /control（handleControl 补全 clientSeq/triggerType/userId）下发播放 */
       return new Promise(function (res) { setTimeout(res, 1800); });
     })
     .then(function () {
-      return ltapi.reportCommand('ai', roomId, {
-        commandType: playing ? 'GOTO' : 'PAUSE',
-        targetSongId: sid,
-        formerSongId: sid,
-        progress: 0,
-        playStatus: playing ? 'PLAY' : 'PAUSE',
+      selfControl({
+        action: 'load',
+        song: { id: sid, name: (o.name || ''), artist: (o.artist || '') },
+        position: 0,
+        autoplay: playing,
+        by: 'ai',
       });
+      console.log('[song→room] dispatch /control load id=' + sid);
     })
-    .then(function (r) { console.log('[song→room] reportCommand ok=' + (r && r.ok)); })
     .catch(function (e) { console.log('[song→room] err:', (e && e.message) || e); });
 }
 
