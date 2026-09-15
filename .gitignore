@@ -14,3 +14,4 @@ player_v3.template.html
 credentials/
 *.cookie
 *.cookies
+.clientseq.json

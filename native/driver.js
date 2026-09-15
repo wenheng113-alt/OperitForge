@@ -27,6 +27,19 @@
 const identity = require('./identity');
 /* P3: 一起听 REST 协议客户端 */
 const ltapi = require('./ltapi');
+const fs = require('fs');
+const path = require('path');
+
+/* P9h: clientSeq 高水位持久化 —— 网易云 APP 按 clientSeq 单调递增去重，
+ * 若进程重启后计数回退，新指令会被 APP 当作过期指令静默忽略。
+ * 这里把"用过的最大序号"落盘，重启后从该值继续，保证永远递增。 */
+const _SEQ_STORE = path.join(__dirname, '..', '.clientseq.json');
+function _loadSeqHi() {
+  try { return Number(JSON.parse(fs.readFileSync(_SEQ_STORE, 'utf8')).hi) || 0; } catch (e) { return 0; }
+}
+function _saveSeqHi(v) {
+  try { fs.writeFileSync(_SEQ_STORE, JSON.stringify({ hi: Number(v) || 0 }), { mode: 0o600 }); } catch (e) {}
+}
 
 /** 合法的接入模式 */
 const MODES = ['local', 'duo', 'solo_ai'];
@@ -59,8 +72,8 @@ function createDriver() {
     account: null,
     /* P5: 双身份账号资料（ai/human），前端「两边头像都取」用 */
     accounts: null,
-    /* P3: 指令序号（服务端幂等用，单调递增） */
-    clientSeq: 0,
+    /* P3: 指令序号（服务端幂等用，单调递增；P9h: 从持久化高水位起步，防重启回退） */
+    clientSeq: _loadSeqHi(),
     /* P7: 下行同步仲裁 —— 上次上行时间 + 上次已应用的远端 seq（去重） */
     lastUploadAt: 0,
     lastRemoteSeq: 0,
@@ -249,8 +262,12 @@ function createDriver() {
       if (status.syncTimer) { clearInterval(status.syncTimer); status.syncTimer = null; }
       const self = this;
       status.syncTimer = setInterval(function () { self.syncOnce(); }, 2000);
-      /* 立即回读一次，避免首次空窗 */
-      self.syncOnce();
+      /* P9h: 先回读一次房间 clientSeq 对齐本地计数，再启动轮询。
+       * 否则重启后首条指令用的是归零后的 1，会被 APP 当过期指令忽略。 */
+      Promise.resolve()
+        .then(function () { return self.syncOnce(); })
+        .catch(function () {})
+        .then(function () { self.syncOnce(); });
     },
 
     /** P5: 回读登录账号资料（头像）→ 写入 status 并广播 native_account
@@ -438,6 +455,15 @@ function createDriver() {
         }
       }
       const cmd = p.playCommand;
+      /* P9h: 关键 —— 从房间回读当前 clientSeq 并抬高本地计数。
+       * 网易云 APP 按 clientSeq **单调递增**去重；服务器重启后本地计数归零，
+       * 若直接发 1、2… 会被 APP 当成「过期指令」静默忽略（表现为"重启后就不换歌了"）。
+       * 这里把本地计数对齐到房间已达的最大值，后续 ++ 必然更大 → APP 一定执行。 */
+      if (cmd && typeof cmd.clientSeq === 'number' && cmd.clientSeq > status.clientSeq) {
+        status.clientSeq = cmd.clientSeq;
+        _saveSeqHi(status.clientSeq);
+        log('P3 clientSeq resynced from room:', cmd.clientSeq);
+      }
       if (!cmd) return null; // 单人房 / 尚无指令
       /* ② 去重：同一 serverSeq 只应用一次 */
       const rseq = Number(cmd.serverSeq || 0);
@@ -569,6 +595,7 @@ function createDriver() {
       const r = await ltapi.reportCommand('ai', status.roomId, cmd);
       if (r.ok) {
         status.lastError = null;
+        _saveSeqHi(status.clientSeq);
         /* P7: 记录上行时间 —— 之后 1500ms 内的远端帧让本地赢，
          * 避免"刚点的歌"被房间里的旧播放态立刻回滚（对齐 sync.js 仲裁）。 */
         status.lastUploadAt = Date.now();
