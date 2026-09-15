@@ -550,13 +550,21 @@ function createDriver() {
        *      用递增小整数会被 APP 当成"远古时间的过期指令"直接忽略
        *      —— 这正是"指令进了房间但 APP 不刷新"的真凶。 */
       const _seqNow = Date.now();
+      /* P9r: 关键 —— 指令要以「用户(human)身份」下发。
+       * 实测：用 ai cookie 下发时，服务端广播的 20000 消息 sender/sendUid = AI(10000000001)，
+       * APP 看到是"对方发来的"→ 失焦/后台时只缓存不执行（u0.v0 的 audio-focus gating）。
+       * 改用 human cookie 下发后，服务端广播 sender/sendUid = human(10000000002)，
+       * APP 视为"我自己操作的"→ 直接执行。故这里优先 human 身份，无 human cookie 才回退 ai。 */
+      const _humanUid = (status.accounts && status.accounts.human && Number(status.accounts.human.userId)) || 0;
+      let _sendWho = 'ai';
+      try { if (identity.readCookie('human')) _sendWho = 'human'; } catch (e) {}
       const cmd = {
         clientSeq: _seqNow,
         /* P9j: 完全对齐官方抓包字段（无 clientTime / ignoreUserId）。
          * serverSeq 必须回填**房间当前值**，否则 APP 可能认为指令不对应当前房间状态。 */
         serverSeq: (status.lastRemote && Number(status.lastRemote.serverSeq)) || 0,
         triggerType: 'MANUAL',
-        userId: status.creatorId || undefined,
+        userId: _humanUid || status.creatorId || undefined,
       };
       let targetSongId = curSongId;
       let progress = curPos;
@@ -611,39 +619,14 @@ function createDriver() {
       cmd.progress = progress;
       cmd.playStatus = playStatus;
 
-      const r = await ltapi.reportCommand('ai', status.roomId, cmd);
+      const r = await ltapi.reportCommand(_sendWho, status.roomId, cmd);
       if (r.ok) {
         status.lastError = null;
         _saveSeqHi(status.clientSeq);
         /* P7: 记录上行时间 —— 之后 1500ms 内的远端帧让本地赢，
          * 避免"刚点的歌"被房间里的旧播放态立刻回滚（对齐 sync.js 仲裁）。 */
         status.lastUploadAt = Date.now();
-        log('P3 command sent:', cmd.commandType, 'song=' + targetSongId, 'seq=' + cmd.clientSeq);
-        /* P9q: 双保险 —— HTTP 下发后再用 IM 长连接直发一条同源 PlayCommandMsg(20000)。
-         * 官方 APP 自身就是走云信「自定义消息」投递播放指令的；HTTP report 走的是
-         * 另一条链路，二者在 APP 端可能被区别对待。这里把两条都发出去，取生效的一条。 */
-        try {
-          const _inner = {
-            serverSeq: Date.now(),
-            cantShowInSongPlay: true,
-            ignoreUserIds: null,
-            onlyCanSeeUserIds: null,
-            roomId: status.roomId,
-            commandType: cmd.commandType,
-            formerSongId: cmd.formerSongId || curSongId,
-            targetSongId: cmd.targetSongId || curSongId,
-            progress: (typeof cmd.progress === 'number') ? cmd.progress : 0,
-            playStatus: cmd.playStatus || 'PLAY',
-            clientSeq: Date.now(),
-            sendUid: Number(status.creatorId) || 0,
-            pushFreq: 'client',
-            operateMsg: {},
-          };
-          const _self = this;
-          imLib.sendPlayCommandGlobal(_inner).then(function (rr) {
-            log('P9q im-direct:', cmd.commandType, 'ok=' + (rr && rr.ok) + (rr && rr.message ? (' ' + rr.message) : ''));
-          }).catch(function (e) { log('P9q im-direct err:', (e && e.message) || e); });
-        } catch (e) { log('P9q im-direct build err:', (e && e.message) || e); }
+        log('P3 command sent(' + _sendWho + '):', cmd.commandType, 'song=' + targetSongId, 'seq=' + cmd.clientSeq);
         /* P4: 下发后回读校准（异步，不阻塞响应） */
         const self = this;
         setTimeout(function () { self.syncOnce(); }, 500);
