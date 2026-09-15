@@ -376,6 +376,24 @@ function detectLocalCommand(text) {
   if (/^(上一首|前一首|回上一首|prev|previous)$/i.test(s)) return 'prev';
   return null;
 }
+/* P9m: 从自然语言里抽取「想听的歌名/歌手」关键词。
+ *   例：「换陈粒的歌」→「陈粒」；「想听正版读心术」→「正版读心术」；
+ *       「放一首周杰伦的晴天」→「周杰伦的晴天」；「来首稻香」→「稻香」。
+ *   若只是「换个/换首歌」这类无对象指令，返回空串（调用方改走随机挑）。 */
+function extractSongQuery(text) {
+  let s = String(text || '').trim();
+  if (!s) return '';
+  /* 去掉常见指令壳 */
+  s = s.replace(/^(帮我|给我|请|麻烦|来|放|换|想听|听|切|点|要|再)/g, '');
+  s = s.replace(/(的歌|的歌曲|歌曲|一首|首|吧|呢|啊|呀|嘛|呗|了|~|～|。|！|!|？|\?)$/g, '');
+  s = s.replace(/^(换|来|放|听|切|点)/g, '');
+  s = s.replace(/(的歌|歌曲)$/g, '');
+  s = s.replace(/[「」【】《》"'']/g, '');
+  s = s.trim();
+  /* 无实义词 → 视为随机换歌 */
+  if (!s || /^(个|一首|首|点|些|歌|曲|新|别的|其他|其他歌|不同|风格)$/.test(s)) return '';
+  return s.slice(0, 30);
+}
 /* P8: 统一转发聊天到网易云一起听房间（真人 APP 聊天区可见）。
  * ⚠️ 身份必须按来源区分：
  *   - 用户/真人发的（from='me'/'host'）→ 用 **human** 身份发送，APP 里显示成「你自己」
@@ -1626,6 +1644,10 @@ const server = http.createServer(async (req, res) => {
       + '可以同时推荐多首，每行一个标记。其余部分正常聊天即可。如果没有点歌需求就别加标记。\n'
       + '【换歌偏好】当用户说「换一首」「来点别的」「随便放」这类没指定歌名时，'
       + '请尽量换**不同歌手/不同风格**的歌，避免总是推那几首；已经推荐过的就别再推。'
+      + '\n【必须执行】只要用户表达了「想听某首歌/某歌手/换个歌」的意图'
+      + '（如「想听XX」「放XX」「换XX的歌」「换一首」），'
+      + '**必须**在回复末尾输出 [PLAY:关键词] 标记来真正切歌，'
+      + '不要只口头答应（「好呀马上换」）却不输出标记——那样歌不会真的换。'
       + '\n【重要·格式约束】你是在播放器聊天框里说话，**只能输出纯文本**。'
       + '禁止输出任何工具调用/函数调用/XML 标签（如 <function_calls>、<invoke>、<parameter>、antml: 等），'
       + '也不要输出 ``` 代码块。想切歌/暂停/播放请直接用 [PLAY:关键词] 标记，或直接说「下一首」即可，'
@@ -1651,9 +1673,12 @@ const server = http.createServer(async (req, res) => {
             }
           } else if (_lc) {
             if (!_fromRoom) selfControl({ action: _lc, by: 'ai' });
-          } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首/.test(String(b.text || ''))) {
-            /* 自然语言换歌意图但模型没给标记 → 兜底挑新鲜的（APP 来源只换 APP） */
-            try { aiPlayRandomFresh(_opts); } catch (e) {}
+          } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首|换[^,。！？\s]{0,12}(歌|曲|音乐)|想听|来首|放首|听点|放一首|来一首|换个歌手|换风格/.test(String(b.text || ''))) {
+            /* P9m: 兜底挑新鲜的。
+             * ⚠️ 若用户话里带了**歌名/歌手**（如「换陈粒的歌」「想听正版读心术」），
+             *    随机挑会忽略指定对象 → 这里优先把「歌名」交给 aiSearchAndPlay。 */
+            var _kw = extractSongQuery(String(b.text || ''));
+            try { if (_kw) aiSearchAndPlay(_kw, true, _opts); else aiPlayRandomFresh(_opts); } catch (e) {}
           }
         }
       } catch (e) {}
