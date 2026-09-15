@@ -534,9 +534,14 @@ function createDriver() {
         };
       }
 
-      /* ---- P3: 动作 → PlayCommand 字段映射（字段名坑：targetSongId ≠ songId）---- */
+      /* ---- P3: 动作 → PlayCommand 字段映射（字段名坑：targetSongId ≠ songId）----
+       * P9i: clientSeq 必须是**毫秒时间戳**（对齐官方客户端抓包），
+       *      用递增小整数会被 APP 当成"远古时间的过期指令"直接忽略
+       *      —— 这正是"指令进了房间但 APP 不刷新"的真凶。 */
+      const _seqNow = Date.now();
       const cmd = {
-        clientSeq: ++status.clientSeq,
+        clientSeq: _seqNow,
+        clientTime: _seqNow,
         serverSeq: 0,
         ignoreUserId: [],
         triggerType: 'MANUAL',
@@ -548,28 +553,31 @@ function createDriver() {
        * 旧实现下 seek/next/prev 一律带 playStatus='PLAYING'，
        * 导致「暂停后页面进度上报（seek）」把房间又拉回播放 →
        * 表现为「本地暂停了，网易云 APP 不停」。 */
-      let playStatus = (snap && snap.playing) ? 'PLAYING' : 'PAUSED';
+      let playStatus = (snap && snap.playing) ? 'PLAY' : 'PAUSE';
       switch (action) {
         case 'play':
           cmd.commandType = 'PLAY';
-          playStatus = 'PLAYING';
+          playStatus = 'PLAY';
           if (typeof b.position === 'number') progress = Math.round(b.position);
           break;
         case 'pause':
           cmd.commandType = 'PAUSE';
-          playStatus = 'PAUSED';
+          playStatus = 'PAUSE';
           break;
         case 'seek':
-          cmd.commandType = 'SEEK';
+          cmd.commandType = 'GOTO';
           /* playStatus 保持跟随 snap（暂停中 seek 不应把房间拉回播放） */
           progress = Math.round(Number(b.position != null ? b.position : b.positionMs) || curPos);
           break;
         case 'load':
-          cmd.commandType = 'PLAY';
+          /* P9i: 切歌必须用 **GOTO**（官方客户端抓包实证）；
+           *      'PLAY' 只切换播放状态，不会让 APP 跳到指定歌曲 →
+           *      表现为"指令成功、房间 target 变了，但 APP 不刷新"。 */
+          cmd.commandType = 'GOTO';
           if (b.song && b.song.id != null) targetSongId = String(b.song.id);
           cmd.formerSongId = curSongId;
           progress = (typeof b.position === 'number') ? Math.round(b.position) : 0;
-          playStatus = (b.autoplay === false) ? 'PAUSED' : 'PLAYING';
+          playStatus = (b.autoplay === false) ? 'PAUSE' : 'PLAY';
           break;
         case 'next':
           cmd.commandType = 'NEXT';
@@ -579,7 +587,7 @@ function createDriver() {
           break;
         case 'toggle':
           cmd.commandType = snap && snap.playing ? 'PAUSE' : 'PLAY';
-          playStatus = (cmd.commandType === 'PAUSE') ? 'PAUSED' : 'PLAYING';
+          playStatus = (cmd.commandType === 'PAUSE') ? 'PAUSE' : 'PLAY';
           break;
         default:
           return {

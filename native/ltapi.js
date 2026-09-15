@@ -365,7 +365,15 @@ async function rejectInvitation(who, roomId) {
 async function reportCommand(who, roomId, cmd) {
   const cookie = identity.readCookie(who);
   if (!cookie) return { ok: false, message: 'no cookie for ' + who };
-  const info = JSON.stringify(cmd || {});
+  /* P9i: 统一兜底补全信封 —— 官方客户端 clientSeq 是毫秒时间戳；
+   * 缺失/为 0 会被 APP 当过期指令忽略。这里对所有调用方一次性兜底。 */
+  const c = Object.assign({}, cmd || {});
+  const _t = Date.now();
+  if (!c.clientSeq) c.clientSeq = _t;
+  if (c.clientTime == null) c.clientTime = _t;
+  if (c.playStatus === 'PLAYING') c.playStatus = 'PLAY';
+  if (c.playStatus === 'PAUSED') c.playStatus = 'PAUSE';
+  const info = JSON.stringify(c);
   const r = await weapiPost('/api/listen/together/play/command/report', { roomId: roomId, commandInfo: info }, cookie);
   const j = parse(r.text);
   if (j && j.code === 200 && j.data && j.data.result === true) {
