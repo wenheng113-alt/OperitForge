@@ -348,11 +348,13 @@ function normalizePlayMarks(text) {
 function hasPlayIntent(text) {
   const s = String(text || '').trim();
   if (!s || s.length > 30) return false;
-  const verbs = /(换|切|听|放|来|点|唱|播|要|想|整|上)/;
-  const objects = /(歌|曲|音乐|首|张|盘|碟|专辑|的)/;
-  if (verbs.test(s) && objects.test(s)) return true;
-  /* 「\u5207\u6362\u8d75\u96f7\u7684\u963f\u5204」这类：虽无「歌」字，但有 切/换 + 「的」→ 也算点歌 */
-  if (/(切换|切到|切成|切一?首|换一?首|换首|听|放|来一?首|点一?首|唱一?首|播一?首)/.test(s)) return true;
+  /* ① 以播放动词开头（后面可直接跟歌名，无需「歌/首」等字）：
+   *   「换阿刁」「切阿刁」「听阿刁」「放阿刁」「来一首阿刁」… */
+  if (/^(换|切|切换|切到|切成|听|放|来|点|唱|播|播放|要听|想听|想点|来一?首|放一?首|点一?首|唱一?首|播一?首|换一?首|切一?首|我想听|我要听|给我放|帮我放|给我来|帮我点|给我切|帮我切)/.test(s)) {
+    return true;
+  }
+  /* ② 含「歌/曲/音乐/首…」等名词 + 任一播放动词 */
+  if (/(换|切|听|放|来|点|唱|播|要|想)/.test(s) && /(歌|曲|音乐|首|张|盘|碟|专辑)/.test(s)) return true;
   return false;
 }
 function stripToolXml(text) {
