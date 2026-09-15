@@ -1,0 +1,16 @@
+node_modules/
+*.log
+*.bak
+*.bak_*
+backup/
+avatar_me.*
+avatar_by.*
+.operit_sync.json
+public/*.bak_*
+public/*.current
+public/test_input*.html
+player_v3.template.html
+# P1: 原生一起听凭据（cookie/token），严禁入库
+credentials/
+*.cookie
+*.cookies

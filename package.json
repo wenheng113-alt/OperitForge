@@ -1,0 +1,22 @@
+{
+  "name": "netease-listen",
+  "version": "1.0.1",
+  "description": "仿网易云音乐「一起听」插件 — 与 AI 实时同步听歌，支持网易云 + QQ音乐双音源",
+  "author": "",
+  "license": "MIT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "netease",
+    "music",
+    "listen-together",
+    "qq-music",
+    "ai",
+    "operit"
+  ]
+}

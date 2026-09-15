@@ -1,0 +1,16 @@
+{
+  "song": null,
+  "playing": false,
+  "positionMs": 0,
+  "anchorTs": 0,
+  "seq": 0,
+  "updatedAt": 0,
+  "updatedBy": "system",
+  "meta": { "distanceKm": "12.6", "listenSeconds": 0 },
+  "playMode": "order",
+  "playlist": [],
+  "history": [],
+  "members": {},
+  "_repeatCount": 0,
+  "_repeatNotified": 0
+}

@@ -1,0 +1,11 @@
+'use strict';
+const fs = require('fs');
+const D = '/home/ubuntu/netease_listen/chat_log.json';
+const a = JSON.parse(fs.readFileSync(D, 'utf8'));
+const re = /workspace_attachment|tool_calls|invoke|parameter|\uFF5C/i;
+const hit = a.filter(m => re.test(String(m.text)));
+console.log('TOTAL=' + a.length);
+console.log('DIRTY_IN_STORE=' + hit.length);
+hit.forEach(m => console.log('!!', m.from, JSON.stringify(m.text)));
+const s = '/home/ubuntu/netease_listen/.operit_sync.json';
+console.log('SYNC_STATE=' + (fs.existsSync(s) ? fs.readFileSync(s, 'utf8').slice(0, 200) : '(none)'));
