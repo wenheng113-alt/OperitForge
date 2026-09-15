@@ -324,6 +324,25 @@ function extractToolIntents(text) {
   }
   return out;
 }
+/* P9z: 兼容「伪标记」——模型常把 system 提示里的标签说明照抄成
+ *   「点歌(自动播放): 赵雷 十九岁」/「推荐: xxx」，而不是规范的 [PLAY:xxx]。
+ *   这会导致 markRe 匹配不到 → 走随机兜底 → 「AI 说的歌」与「实际放的歌」不符。
+ *   这里把这类独立成行的伪标记统一还原成规范标记。 */
+function normalizePlayMarks(text) {
+  let s = String(text || '');
+  /* 点歌(自动播放): XXX / 点歌（自动播放）：XXX */
+  s = s.replace(/(?:^|\n)[\s\-•*]*点歌\s*[（(][^）)\n]*[）)]\s*[:：]\s*([^\n]+)/g,
+    function (m, kw) { return '\n[PLAY:' + String(kw).trim().replace(/^\[?PLAY[:：]?/i, '').replace(/\]$/, '') + ']'; });
+  /* 点歌: XXX / 播放: XXX / 放歌: XXX */
+  s = s.replace(/(?:^|\n)[\s\-•*]*(?:点歌|播放|放歌)\s*[:：]\s*([^\n]+)/g,
+    function (m, kw) { return '\n[PLAY:' + String(kw).trim().replace(/^\[?PLAY[:：]?/i, '').replace(/\]$/, '') + ']'; });
+  /* 推荐歌曲(不自动播放): XXX / 推荐: XXX */
+  s = s.replace(/(?:^|\n)[\s\-•*]*(?:推荐歌曲|推荐)\s*[（(][^）)\n]*[）)]\s*[:：]\s*([^\n]+)/g,
+    function (m, kw) { return '\n[RECOMMEND:' + String(kw).trim().replace(/^\[?RECOMMEND[:：]?/i, '').replace(/\]$/, '') + ']'; });
+  s = s.replace(/(?:^|\n)[\s\-•*]*(?:推荐歌曲|推荐)\s*[:：]\s*([^\n]+)/g,
+    function (m, kw) { return '\n[RECOMMEND:' + String(kw).trim().replace(/^\[?RECOMMEND[:：]?/i, '').replace(/\]$/, '') + ']'; });
+  return s;
+}
 function stripToolXml(text) {
   let s = String(text || '');
   s = s.replace(/<(?:antml:)?function_calls[^>]*>[\s\S]*?<\/(?:antml:)?function_calls>/gi, '');
@@ -1780,10 +1799,10 @@ const server = http.createServer(async (req, res) => {
       sysPrompt += '\n【当前播放列表】' + state.playlist.slice(0, 10).map(function(s) { return (s.name||'') + '-' + (s.artist||''); }).join('、');
     }
     /* AI智能点歌指令 */
-    sysPrompt += '\n\n【特殊指令】如果你想在回复中点歌或推荐歌曲，请在回复末尾单独一行加上标记：\n'
-      + '- 点歌(自动播放): [PLAY:搜索关键词]\n'
-      + '- 推荐(不自动播放，显示为可点击卡片): [RECOMMEND:搜索关键词]\n'
-      + '- 推荐整张歌单(用户点确认后整单替换播放列表): [PLAYLIST:歌单ID或关键词]\n'
+    sysPrompt += '\n\n【特殊指令】如果你想在回复中点歌或推荐歌曲，请在回复末尾单独一行输出**方括号标记**（这是系统解析的唯一格式）：\n'
+      + '- 自动点播某首歌 → 输出 [PLAY:搜索关键词]\n'
+      + '- 只推荐、不播放 → 输出 [RECOMMEND:搜索关键词]\n'
+      + '- 推荐整张歌单（用户确认后整单替换）→ 输出 [PLAYLIST:歌单ID或关键词]\n'
       + '示例: "好呀，给你放一首~ [PLAY:周杰伦 晴天]"\n'
       + '示例: "推荐几首适合写作业的~ [RECOMMEND:轻音乐 纯音乐 学习]"\n'
       + '示例: "给你挑了张歌单，确认就整单换上~ [PLAYLIST:华语 经典]"\n'
@@ -1794,6 +1813,9 @@ const server = http.createServer(async (req, res) => {
       + '（如「想听XX」「我要听XX」「放XX」「换XX的歌」「换一首」），'
       + '**必须**在回复末尾输出 [PLAY:关键词] 标记来真正切歌，'
       + '不要只口头答应（「好呀马上换」）却不输出标记——那样歌不会真的换。'
+      + '\n【硬性格式·极重要】标记**必须**带方括号、紧贴写成 [PLAY:xxx] 或 [RECOMMEND:xxx]。'
+      + '**禁止**写成「点歌(自动播放): xxx」「推荐: xxx」「PLAY: xxx」这种没有方括号的纯文本——'
+      + '那样系统无法识别，会导致"你嘴上说的歌"和"实际播放的歌"不一致。'
       + '\n【硬规则】只要用户是在「点歌/指定想听的内容」，**一律用 [PLAY:关键词]**（会自动播放）；'
       + '**禁止**在这种情况下用 [RECOMMEND:]——RECOMMEND 只是展示卡片、不会真的播放，'
       + '用户会以为你已经切歌了但其实没有。只有用户明确说「推荐几首/给点建议」时才用 RECOMMEND。'
@@ -1806,6 +1828,8 @@ const server = http.createServer(async (req, res) => {
     callLLM(messages, (err, reply) => {
       if (err) { return json(res, 200, { ok: false, error: err }); }
       var raw = String(reply).slice(0, 800);
+      /* P9z 诊断：打印 AI 原始输出（含 [PLAY:] 标记），定位"文案与实播不符" */
+      console.log('[AI] raw reply:', JSON.stringify(raw));
       /* ⓪ 确定性本地控制指令（暂停/继续/上一首/下一首）：直接落地，
        *    不依赖模型是否输出工具块（实测「暂停一下」模型只口头答应不落地）。
        *    ⚠️ 仅当模型未给出 [PLAY:] 点歌标记时才兜底，避免与「换一首」的推荐点歌冲突。 */
@@ -1834,7 +1858,7 @@ const server = http.createServer(async (req, res) => {
       /* ① 工具调用 XML → 落地为本地动作（修复「换一首」气泡空白） */
       try { extractToolIntents(raw).forEach(function (it) { applyToolIntent(it, _opts); }); } catch (e) {}
       /* ② 从展示文本中剥离工具 XML，避免气泡空白 */
-      raw = stripToolXml(raw);
+      raw = stripToolXml(normalizePlayMarks(raw));
       if (!raw) raw = '（已执行操作）';
       /* 解析 [PLAY:xxx] 和 [RECOMMEND:xxx] 标记 */
       var playMarks = [], recMarks = [], plMarks = [];
