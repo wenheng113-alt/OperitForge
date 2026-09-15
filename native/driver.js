@@ -176,10 +176,22 @@ function createDriver() {
         return st;
       }
 
-      /* P3: 用 AI 身份 cookie 真实建房/进房，拿到 roomId → connected=true */
+      /* P3: 用 AI 身份 cookie 真实建房/进房，拿到 roomId → connected=true
+       * P8-fix: 建房可能因网络抖动 timeout（实测启动时偶发 → connected=false，
+       *         导致后续切歌/发言全部「未接入房间」静默失败）。这里最多重试 3 次。 */
       try {
-        const res = await ltapi.createRoom('ai');
-        if (!res.ok || !res.roomId) {
+        let res = null;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            res = await ltapi.createRoom('ai');
+          } catch (e) {
+            res = { ok: false, message: String((e && e.message) || e) };
+          }
+          if (res && res.ok && res.roomId) break;
+          log('P3 createRoom attempt ' + attempt + ' failed: ' + (res && res.message || 'unknown'));
+          if (attempt < 3) await new Promise(function (r) { setTimeout(r, 800 * attempt); });
+        }
+        if (!res || !res.ok || !res.roomId) {
           status.connected = false;
           status.lastError = '建房失败：' + (res.message || '未知错误');
           log('P3 createRoom failed:', status.lastError);
@@ -506,10 +518,15 @@ function createDriver() {
       };
       let targetSongId = curSongId;
       let progress = curPos;
-      let playStatus = 'PLAYING';
+      /* P8-fix: playStatus 默认**跟随本地真实播放态**，而不是硬编码 'PLAYING'。
+       * 旧实现下 seek/next/prev 一律带 playStatus='PLAYING'，
+       * 导致「暂停后页面进度上报（seek）」把房间又拉回播放 →
+       * 表现为「本地暂停了，网易云 APP 不停」。 */
+      let playStatus = (snap && snap.playing) ? 'PLAYING' : 'PAUSED';
       switch (action) {
         case 'play':
           cmd.commandType = 'PLAY';
+          playStatus = 'PLAYING';
           if (typeof b.position === 'number') progress = Math.round(b.position);
           break;
         case 'pause':
@@ -518,6 +535,7 @@ function createDriver() {
           break;
         case 'seek':
           cmd.commandType = 'SEEK';
+          /* playStatus 保持跟随 snap（暂停中 seek 不应把房间拉回播放） */
           progress = Math.round(Number(b.position != null ? b.position : b.positionMs) || curPos);
           break;
         case 'load':
@@ -525,7 +543,7 @@ function createDriver() {
           if (b.song && b.song.id != null) targetSongId = String(b.song.id);
           cmd.formerSongId = curSongId;
           progress = (typeof b.position === 'number') ? Math.round(b.position) : 0;
-          if (b.autoplay === false) playStatus = 'PAUSED';
+          playStatus = (b.autoplay === false) ? 'PAUSED' : 'PLAYING';
           break;
         case 'next':
           cmd.commandType = 'NEXT';
@@ -535,7 +553,7 @@ function createDriver() {
           break;
         case 'toggle':
           cmd.commandType = snap && snap.playing ? 'PAUSE' : 'PLAY';
-          if (cmd.commandType === 'PAUSE') playStatus = 'PAUSED';
+          playStatus = (cmd.commandType === 'PAUSE') ? 'PAUSED' : 'PLAYING';
           break;
         default:
           return {

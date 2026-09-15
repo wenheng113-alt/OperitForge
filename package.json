@@ -18,5 +18,8 @@
     "qq-music",
     "ai",
     "operit"
-  ]
+  ],
+  "dependencies": {
+    "nim-web-sdk-ng": "^10.11.0"
+  }
 }

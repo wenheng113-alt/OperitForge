@@ -392,6 +392,187 @@ async function userAccount(who) {
   return { ok: false, message: (j && j.message) || ('HTTP ' + r.status), raw: j };
 }
 
+/* ==================================================================
+ * 播放列表变更（REPLACE 全量替换）—— P8 新增，2026-09 融合参考实现
+ * ------------------------------------------------------------------
+ *  参考实现 room.js 实测结论（Frida hook okhttp 抓官方真实载荷）：
+ *    ✅ 加歌 / 换歌单走 POST /api/listen/together/sync/list/command/report
+ *       载荷是 commandType:'REPLACE' + **完整 displayList**（不是 ADD 增量）。
+ *       旧实现用 operationType:'ADD' 是错误语义，服务端一律假成功。
+ *    实测：15 → 17 首（追加） ✅    17 → 77 首（整单替换） ✅
+ *  ⚠️ result:true 不代表生效，必须回读 syncPlaylist 做 diff 才作数。
+ * ================================================================== */
+
+/** 一起听接口路径（全部实测存在，融合自参考 room.js）。 */
+const PATHS = {
+  create: '/api/listen/together/room/create',
+  accept: '/api/listen/together/play/invitation/accept',
+  end: '/api/listen/together/end/v2',
+  heartbeat: '/api/listen/together/heartbeat',
+  status: '/api/listen/together/status/get',
+  playlist: '/api/listen/together/sync/playlist/get',
+  playCommand: '/api/listen/together/play/command/report',
+  listCommand: '/api/listen/together/sync/list/command/report',
+};
+
+/** 心跳默认进度（毫秒），非零值更像正常客户端。 */
+const DEFAULT_PROGRESS = 30000;
+
+/**
+ * 构造切歌指令（返回 JSON 字符串，塞进 commandInfo 时是「字符串套 JSON」）。
+ * ⚠️ 字段名坑：必须用 targetSongId / formerSongId，**不是 songId**。
+ *    用 songId 时接口照样返回 result:true，但 serverSeq 纹丝不动（假成功）。
+ * @returns {string}
+ */
+function buildCommandInfo(o) {
+  const opts = o || {};
+  const t = Date.now();
+  const target = String(opts.targetSongId !== undefined ? opts.targetSongId : opts.songId);
+  const former = String(opts.formerSongId !== undefined ? opts.formerSongId : target);
+  return JSON.stringify({
+    commandType: opts.commandType || 'GOTO',
+    targetSongId: target,
+    formerSongId: former,
+    playStatus: opts.playStatus || 'PLAY',
+    progress: opts.progress || 0,
+    clientSeq: t,
+    clientTime: t,
+  });
+}
+
+/**
+ * 构造播放列表变更指令（返回 JSON 字符串）。
+ * 核心认知：房间列表没有「加一首」的语义，只有「用完整列表 REPLACE」。
+ * @param {object} o
+ * @param {Array} o.displayList 完整歌单（必须全量！）
+ * @param {Array} [o.version] 当前版本数组（从 syncPlaylist.playlistVersion 取）
+ * @returns {string}
+ */
+function buildPlaylistParam(o) {
+  const opts = o || {};
+  const list = (opts.displayList || []).map(String);
+  const anchorSongId = opts.anchorSongId != null
+    ? String(opts.anchorSongId)
+    : (list.length ? list[list.length - 1] : '');
+  const anchorPosition = opts.anchorPosition != null
+    ? opts.anchorPosition
+    : Math.max(0, list.length - 1);
+  return JSON.stringify({
+    anchorPosition: anchorPosition,
+    anchorSongId: anchorSongId,
+    clientSeq: Date.now(),
+    commandType: opts.commandType || 'REPLACE',
+    displayList: list,
+    randomList: [],
+    version: opts.version || [],
+  });
+}
+
+/**
+ * 用一份**完整列表**替换房间歌单（换歌单 / 加歌都走这里）。
+ *   POST /api/listen/together/sync/list/command/report
+ *   body { roomId, playlistParam: <REPLACE JSON 字符串> }
+ * ⚠️ 返回 result:true 不代表生效，调用方必须回读 syncPlaylist 复核。
+ * @returns {ok, result, message, raw}
+ */
+async function replaceList(who, roomId, displayList, opts) {
+  const cookie = identity.readCookie(who);
+  if (!cookie) return { ok: false, message: 'no cookie for ' + who };
+  const o = opts || {};
+  let version = o.version;
+  if (!version) {
+    const cur = await syncPlaylist(who, roomId);
+    version = (cur && cur.playlistVersion) || [];
+  }
+  const playlistParam = o.rawPlaylistParam || buildPlaylistParam({
+    displayList: displayList,
+    version: version,
+    anchorSongId: o.anchorSongId,
+    anchorPosition: o.anchorPosition,
+  });
+  const r = await weapiPost(PATHS.listCommand, { roomId: roomId, playlistParam: playlistParam }, cookie);
+  const j = parse(r.text);
+  if (j && j.code === 200) return { ok: true, result: true, data: (j.data || null), raw: j };
+  return { ok: false, message: (j && j.message) || ('HTTP ' + r.status), raw: j };
+}
+
+/**
+ * 把歌**追加**进房间列表（v0.4 已跑通）。
+ * 实现：读当前列表 → 去重追加 → 整份 REPLACE 回去。
+ *
+ * ⚠️ 2026-09 真机实测：REPLACE 生效有 **约 3–5 秒服务端传播延迟**，
+ *    即时回读会读到旧列表从而误判为「假成功」。故本函数默认做
+ *    带重试的延迟验证（verify），`verified:true` 才算真正生效。
+ * @param {string} who
+ * @param {string} roomId
+ * @param {Array} songIds 要追加的歌
+ * @param {object} [opts] {dedupe=true, verify=true, verifyRetries=5, verifyDelayMs=1500}
+ * @returns {ok, before, after, added, verified, message}
+ */
+async function addSongs(who, roomId, songIds, opts) {
+  const o = opts || {};
+  const cur = await syncPlaylist(who, roomId);
+  if (!cur.ok) return { ok: false, message: cur.message || 'read playlist failed', raw: cur.raw };
+  const before = (cur.songIds || []).map(String);
+  const incoming = (songIds || []).map(String);
+  const dedupe = o.dedupe !== false;
+  const fresh = dedupe ? incoming.filter(function (id) { return before.indexOf(id) < 0; }) : incoming;
+  if (!fresh.length) {
+    return { ok: true, before: before.length, after: before.length, added: [], verified: true, result: true };
+  }
+  const displayList = before.concat(fresh);
+  const r = await replaceList(who, roomId, displayList, {
+    version: cur.playlistVersion,
+    anchorSongId: fresh[fresh.length - 1],
+    anchorPosition: displayList.length - 1,
+  });
+  if (!r.ok) return { ok: false, before: before.length, after: before.length, added: [], message: r.message, raw: r.raw };
+  /* 带重试的延迟验证：服务端 REPLACE 传播有 3–5s 延迟 */
+  let verified = false;
+  let observed = before.length;
+  if (o.verify !== false) {
+    const retries = o.verifyRetries != null ? o.verifyRetries : 5;
+    const delayMs = o.verifyDelayMs != null ? o.verifyDelayMs : 1500;
+    for (let i = 0; i < retries; i += 1) {
+      await new Promise(function (res) { setTimeout(res, delayMs); });
+      const chk = await syncPlaylist(who, roomId);
+      if (chk && chk.ok && Array.isArray(chk.songIds)) {
+        observed = chk.songIds.length;
+        if (observed >= displayList.length) { verified = true; break; }
+      }
+    }
+  } else {
+    verified = true; /* 未开启验证时不阻塞返回 */
+  }
+  return {
+    ok: true, before: before.length, after: displayList.length, added: fresh,
+    verified: verified, observed: observed, result: true,
+    message: verified ? '' : ('已下发 REPLACE（result:true），但 ' + (o.verifyRetries || 5) + ' 次回读仍为 ' + observed + ' 首 —— 服务端可能有更长延迟或未生效，请再回读确认'),
+  };
+}
+
+/**
+ * 心跳 + 房间存活判定（融合参考 heartbeatChecked）。
+ * 官方在**对方关房**时心跳返回 488（已由对方结束）→ 调用方应清空本地
+ * roomId 重找邀请，否则会死守一个已消失的房间。
+ * 网络错误不判定为房间消失，避免抖动误清。
+ * @returns {alive, code, reason, raw}
+ */
+async function heartbeatChecked(who, roomId, opts) {
+  let r;
+  try {
+    r = await heartbeat(who, roomId, opts);
+  } catch (e) {
+    return { alive: true, code: 0, reason: 'network_error', raw: null };
+  }
+  // 心跳返回体顶层可能是 code，也可能封装在 raw
+  const code = Number((r && r.raw && r.raw.code) || (r && r.ok ? 200 : (r && r.code) || 0));
+  if (code === 488) return { alive: false, code: 488, reason: 'ended_by_peer', raw: r.raw };
+  if (r && r.ok) return { alive: true, code: 200, reason: 'ok', raw: r.raw };
+  if (code && code !== 200) return { alive: false, code: code, reason: 'room_gone', raw: r.raw };
+  return { alive: false, code: code || 0, reason: 'failed', raw: r.raw };
+}
+
 module.exports = {
   createRoom: createRoom, statusGet: statusGet, heartbeat: heartbeat,
   endCheck: endCheck, endRoom: endRoom,
@@ -399,4 +580,12 @@ module.exports = {
   acceptInvitation: acceptInvitation, rejectInvitation: rejectInvitation,
   reportCommand: reportCommand, userAccount: userAccount, weapiPost: weapiPost,
   syncPlaylist: syncPlaylist,
+  // P8 新增（REPLACE 全量替换 + 心跳存活判定）
+  PATHS: PATHS,
+  DEFAULT_PROGRESS: DEFAULT_PROGRESS,
+  buildCommandInfo: buildCommandInfo,
+  buildPlaylistParam: buildPlaylistParam,
+  replaceList: replaceList,
+  addSongs: addSongs,
+  heartbeatChecked: heartbeatChecked,
 };

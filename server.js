@@ -16,6 +16,10 @@ const nativeDriver = require('./native/driver').createDriver();
 const qrlogin = require('./native/qrlogin');
 /* P2 扩展: 短信验证码登录（weapi 加密换 cookie） */
 const smslogin = require('./native/smslogin');
+/* P8: 原生一起听 REST 能力（REPLACE 加歌 / 邀请解析 / 房间发言） */
+const ltapi = require('./native/ltapi');
+const inviteLib = require('./native/invite');
+const messageLib = require('./native/message');
 
 const PORT = process.env.LT_PORT || 18765;
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -95,6 +99,7 @@ function triggerProactiveRepeat(song, count) {
     var msg = addChat('ai', '好友', text);
     msg.popEmoji = '🎵';
     broadcast('chat', msg);
+    forwardChatToRoom('ai', text);
   });
 }
  function pushHistory(song) {
@@ -291,6 +296,196 @@ async function transcribeAudio(b64, format) {
     return { ok: false, error: '转写返回为空' };
   } catch (e) { return { ok: false, error: '解析转写结果失败' }; }
 }
+/* ---------------- 工具调用 XML 清理（模型偶尔输出 Operit 工具块导致气泡空白） ----------------
+ * 实测：用户说「换一首」时，模型会返回
+ *   <function_calls><invoke name="netease_listen:ai_play_control">
+ *     <parameter name="action">next</parameter></invoke></function_calls>
+ * 旧实现只清理 [PLAY:xxx] 标记，此 XML 原样广播 → 前端当作 HTML 标签吞掉 → 气泡空白。
+ * 这里：① 提取工具意图并落地为真正的本地动作；② 从展示文本中剥离 XML。 */
+function extractToolIntents(text) {
+  const out = [];
+  const s = String(text || '');
+  const invokeRe = /<(?:antml:)?invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/(?:antml:)?invoke>/gi;
+  let m;
+  while ((m = invokeRe.exec(s)) !== null) {
+    const tool = m[1];
+    const inner = m[2];
+    const params = {};
+    const pRe = /<(?:antml:)?parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/(?:antml:)?parameter>/gi;
+    let pm;
+    while ((pm = pRe.exec(inner)) !== null) params[pm[1]] = String(pm[2]).trim();
+    out.push({ tool: tool, params: params });
+  }
+  return out;
+}
+function stripToolXml(text) {
+  let s = String(text || '');
+  s = s.replace(/<(?:antml:)?function_calls[^>]*>[\s\S]*?<\/(?:antml:)?function_calls>/gi, '');
+  s = s.replace(/<(?:antml:)?invoke\s+name="[^"]*"[^>]*>[\s\S]*?<\/(?:antml:)?invoke>/gi, '');
+  s = s.replace(/<(?:antml:)?invoke[^>]*\/>/gi, '');
+  s = s.replace(/<\s*(?:antml:)?(?:invoke|parameter|function_calls)\b[^>]*>/gi, '');
+  s = s.replace(/<\s*\/\s*(?:antml:)?(?:invoke|parameter|function_calls)\s*>/gi, '');
+  s = s.replace(/`{3,}/g, '');
+  s = s.replace(/\n{3,}/g, '\n\n');
+  return s.trim();
+}
+/* 把工具意图落地为本地动作（复用现有 /control 全套逻辑，零重复实现） */
+function selfControl(body) {
+  try {
+    const data = JSON.stringify(body || {});
+    const r = http.request({
+      host: '127.0.0.1', port: PORT, path: '/control', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    });
+    r.on('error', function () {});
+    r.write(data);
+    r.end();
+  } catch (e) {}
+}
+function applyToolIntent(it) {
+  try {
+    const tool = String((it && it.tool) || '');
+    const p = (it && it.params) || {};
+    const action = String(p.action || '').toLowerCase();
+    if (/ai_play_control/.test(tool)) {
+      if (['next', 'prev', 'play', 'pause', 'toggle'].indexOf(action) >= 0) {
+        selfControl({ action: action, by: 'ai' });
+      } else if (action === 'seek' && (p.position_ms != null || p.position != null)) {
+        selfControl({ action: 'seek', position: Number(p.position_ms != null ? p.position_ms : p.position) || 0, by: 'ai' });
+      }
+    } else if (/play_song|play_from_favorite/.test(tool)) {
+      const kw = p.keyword || p.song_name || p.song_id;
+      if (kw) { try { aiSearchAndPlay(String(kw), true); } catch (e) {} }
+    }
+  } catch (e) {}
+}
+/* 确定性本地控制指令识别：短句祈使句直接落地，不依赖模型是否输出工具块。
+ * 实测「暂停一下」模型只口头答应、未落地 → 这里兜底。 */
+function detectLocalCommand(text) {
+  const s = String(text || '').replace(/\s/g, '');
+  if (!s || s.length > 12) return null;
+  if (/^(暂停|停一下|暂停一下|别放了|先停|pause)$/i.test(s)) return 'pause';
+  if (/^(继续|继续播放|接着放|播放|放吧|play|恢复播放)$/i.test(s)) return 'play';
+  if (/^(下一首|切歌|换一首|换歌|换首|切下一首|next|来下一首|换一首歌)$/i.test(s)) return 'next';
+  if (/^(上一首|前一首|回上一首|prev|previous)$/i.test(s)) return 'prev';
+  return null;
+}
+/* P8: 统一转发聊天到网易云一起听房间（真人 APP 聊天区可见）。
+ * ⚠️ 身份必须按来源区分：
+ *   - 用户/真人发的（from='me'/'host'）→ 用 **human** 身份发送，APP 里显示成「你自己」
+ *   - AI 回复（from='ai'）           → 用 **ai** 身份发送
+ * 房间内文字走 HTTP /api/middle/im/chatroom/send，**不需要云信 SDK**。 */
+function forwardChatToRoom(from, text) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  try {
+    let ds = {};
+    try { ds = nativeDriver.status() || {}; } catch (e) {}
+    const chatroomId = ds.chatRoomId || state.native.chatRoomId || '';
+    const roomId = ds.roomId || state.native.roomId || '';
+    if (!chatroomId) { console.log('[chat→room] skip: no chatRoomId（未接入房间）'); return; }
+    const who = (from === 'ai') ? 'ai' : 'human';
+    /* P9: 记录本地主动转发的文本，供 roomwatch 做「回声过滤」，
+     *     避免本地播放器发的话被云信读回后又触发一次 AI 回复。 */
+    _recentForwarded[t] = Date.now();
+    const svc = new messageLib.MessageService(who);
+    svc.sendToRoom({ chatroomId: chatroomId, text: t.slice(0, 700), roomId: roomId, ltType: 'FRIEND' })
+      .then(function (r) { console.log('[chat→room]', who, 'code=' + (r && r.code)); })
+      .catch(function (e) { console.log('[chat→room]', who, 'error:', (e && e.message) || e); });
+  } catch (e) {}
+}
+/** P9: 本地最近转发到房间的文本 → 时间戳（回声过滤用） */
+const _recentForwarded = {};
+function _pruneForwarded() {
+  const now = Date.now();
+  Object.keys(_recentForwarded).forEach(function (k) {
+    if (now - _recentForwarded[k] > 8000) delete _recentForwarded[k];
+  });
+}
+/* ============================================================
+ * P9: 房间「读消息」闭环 —— 网易云 APP 里真人发言 → 本地感知 → AI 回复
+ * ------------------------------------------------------------
+ *  背景：HTTP 层 chatroom/{history,messages,get} 全部 404（已复测），
+ *        读房间消息唯一途径是云信长连接（native/im.js + roomwatch.js）。
+ *  链路：roomwatch 常驻收包 → pull → 回灌本地 chatLog（from='me'）
+ *        → 触发本地 AI 回复（复用 /ai/chat 全套逻辑，含点歌/推荐/转发）
+ * ============================================================ */
+const roomwatchLib = require('./native/roomwatch');
+const roomWatch = roomwatchLib.createRoomWatch();
+let _roomWatchCursor = 0;
+let _roomWatchTimer = null;
+let _roomWatchLastErr = '';
+let _roomWatchLastStart = 0;
+
+/** 把一条真人房间消息回灌本地，并触发 AI 回复（复用 /ai/chat） */
+function handleRoomHumanMessage(m) {
+  try {
+    const nick = m.senderNick || '好友';
+    const text = String(m.text || '').trim();
+    if (!text) return;
+    /* P9 回声过滤：本地刚转发出去的话会被云信读回（human 身份），
+     * 此时不能再次触发 AI 回复，否则会「自问自答」刷屏。 */
+    _pruneForwarded();
+    if (_recentForwarded[text]) {
+      console.log('[roomwatch] echo skipped (local forward):', text.slice(0, 40));
+      return;
+    }
+    console.log('[roomwatch] human:', nick, '|', text.slice(0, 60));
+    /* ① 回灌到本地聊天（标记来源房间，避免与本地输入重复） */
+    const msg = addChat('me', nick, text);
+    msg.fromRoom = true;
+    broadcast('chat', msg);
+    /* ② 触发 AI 回复：走本地 /ai/chat，复用完整链路（点歌/推荐/身份转发） */
+    selfPostChat(text);
+  } catch (e) { console.log('[roomwatch] handle error:', (e && e.message) || e); }
+}
+
+/** 向本机 /ai/chat 发一条消息（用于把房间消息喂给 AI），不阻塞 */
+function selfPostChat(text) {
+  const body = JSON.stringify({ text: String(text || '').slice(0, 500) });
+  const req = http.request({
+    host: '127.0.0.1', port: PORT, path: '/ai/chat', method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  }, function (r) { r.resume(); });
+  req.on('error', function (e) { console.log('[roomwatch] selfPostChat error:', e.message); });
+  req.write(body); req.end();
+}
+
+/** 尝试启动云信房间监听（需已接入房间） */
+function tryStartRoomWatch() {
+  const ds = (function () { try { return nativeDriver.status() || {}; } catch (e) { return {}; } })();
+  if (!ds.connected || !ds.roomId || !ds.chatRoomId) return;
+  if (roomWatch.status().started) return;
+  if (Date.now() - _roomWatchLastStart < 15000) return; // 失败退避，避免频繁重连
+  _roomWatchLastStart = Date.now();
+  roomWatch.start({
+    roomId: ds.roomId,
+    chatroomId: ds.chatRoomId,
+    nick: (ds.account && ds.account.nickname) || '',
+  }).then(function (r) {
+    _roomWatchCursor = roomWatch.cursor(); // 跳过历史，只收新消息
+    _roomWatchLastErr = '';
+    console.log('[roomwatch] started chatroomId=' + r.chatroomId + ' (cursor=' + _roomWatchCursor + ')');
+  }).catch(function (e) {
+    _roomWatchLastErr = String((e && e.message) || e);
+    console.log('[roomwatch] start failed:', _roomWatchLastErr);
+  });
+}
+
+/** 轮询消费 roomwatch 缓冲 */
+function roomWatchTick() {
+  try {
+    if (!roomWatch.status().started) return;
+    const items = roomWatch.pull(_roomWatchCursor);
+    for (let i = 0; i < items.length; i += 1) {
+      _roomWatchCursor = items[i].seq;
+      handleRoomHumanMessage(items[i].msg);
+    }
+  } catch (e) {}
+}
+_roomWatchTimer = setInterval(function () { tryStartRoomWatch(); roomWatchTick(); }, 2000);
+if (_roomWatchTimer.unref) _roomWatchTimer.unref();
+
 function fetchUpstreamJson(pathWithQuery) {
   return new Promise((resolve, reject) => {
     http.get(NETEASE_API + pathWithQuery, { headers: { 'User-Agent': 'curl/7.68.0' } }, ur => {
@@ -774,7 +969,7 @@ const server = http.createServer(async (req, res) => {
    * GET  /mode → 查当前模式与驱动状态
    * POST /mode {mode:'local'|'duo'|'solo_ai'} → 切换 */
   if (p === '/mode' && req.method === 'GET') {
-    return json(res, 200, { ok: true, mode: state.mode, native: Object.assign({}, state.native, nativeDriver.status()) });
+    return json(res, 200, { ok: true, mode: state.mode, roomWatch: Object.assign({}, roomWatch.status(), { lastErr: _roomWatchLastErr }), native: Object.assign({}, state.native, nativeDriver.status()) });
   }
   if (p === '/mode' && req.method === 'POST') {
     const b = await readBody(req);
@@ -796,6 +991,8 @@ const server = http.createServer(async (req, res) => {
       state.native.lastSyncTs = st.lastSyncTs || 0;
       state.seq++;
       pushState('mode_change');
+      /* P9: 模式切换成功后立即尝试启动房间读消息监听 */
+      try { tryStartRoomWatch(); } catch (e) {}
       return json(res, 200, { ok: true, mode: state.mode, native: Object.assign({}, state.native, nativeDriver.status()) });
     } catch (e) {
       state.native.lastError = String((e && e.message) || e);
@@ -1201,6 +1398,7 @@ const server = http.createServer(async (req, res) => {
     msg.popEmoji = '🎧';
     msg.playlistCard = card2;
     broadcast('chat', msg);
+    forwardChatToRoom('ai', text2);
     return json(res, 200, { ok: true, count: card2.count, msgId: msg.id, playlist: card2.name });
   }
   /* 用户确认: 执行整单替换 */
@@ -1242,6 +1440,8 @@ const server = http.createServer(async (req, res) => {
     const msg = addChat(b.from, b.name, b.text);
     if (b.popEmoji) msg.popEmoji = String(b.popEmoji).slice(0, 8);
     broadcast('chat', msg);
+    /* P8: 转发到网易云房间（真人用 human 身份、AI 用 ai 身份） */
+    forwardChatToRoom(b.from, b.text);
     return json(res, 200, { ok: true, msg });
   }
   if (p === '/chat/clear' && req.method === 'POST') {
@@ -1338,12 +1538,30 @@ const server = http.createServer(async (req, res) => {
       + '示例: "好呀，给你放一首~ [PLAY:周杰伦 晴天]"\n'
       + '示例: "推荐几首适合写作业的~ [RECOMMEND:轻音乐 纯音乐 学习]"\n'
       + '示例: "给你挑了张歌单，确认就整单换上~ [PLAYLIST:华语 经典]"\n'
-      + '可以同时推荐多首，每行一个标记。其余部分正常聊天即可。如果没有点歌需求就别加标记。';
+      + '可以同时推荐多首，每行一个标记。其余部分正常聊天即可。如果没有点歌需求就别加标记。\n'
+      + '\n【重要·格式约束】你是在播放器聊天框里说话，**只能输出纯文本**。'
+      + '禁止输出任何工具调用/函数调用/XML 标签（如 <function_calls>、<invoke>、<parameter>、antml: 等），'
+      + '也不要输出 ``` 代码块。想切歌/暂停/播放请直接用 [PLAY:关键词] 标记，或直接说「下一首」即可，'
+      + '系统会自动执行，无需你调用工具。';
     const messages = [{ role: 'system', content: sysPrompt }].concat(recent);
     messages.push({ role: 'user', content: String(b.text || '').slice(0, 500) });
     callLLM(messages, (err, reply) => {
       if (err) { return json(res, 200, { ok: false, error: err }); }
       var raw = String(reply).slice(0, 800);
+      /* ⓪ 确定性本地控制指令（暂停/继续/上一首/下一首）：直接落地，
+       *    不依赖模型是否输出工具块（实测「暂停一下」模型只口头答应不落地）。
+       *    ⚠️ 仅当模型未给出 [PLAY:] 点歌标记时才兜底，避免与「换一首」的推荐点歌冲突。 */
+      try {
+        if (!/\[PLAY:[^\]]+\]/.test(raw)) {
+          var _lc = detectLocalCommand(b.text);
+          if (_lc) selfControl({ action: _lc, by: 'ai' });
+        }
+      } catch (e) {}
+      /* ① 工具调用 XML → 落地为本地动作（修复「换一首」气泡空白） */
+      try { extractToolIntents(raw).forEach(applyToolIntent); } catch (e) {}
+      /* ② 从展示文本中剥离工具 XML，避免气泡空白 */
+      raw = stripToolXml(raw);
+      if (!raw) raw = '（已执行操作）';
       /* 解析 [PLAY:xxx] 和 [RECOMMEND:xxx] 标记 */
       var playMarks = [], recMarks = [], plMarks = [];
       var markRe = /\[(PLAY|RECOMMEND|PLAYLIST):([^\]]+)\]/g;
@@ -1373,12 +1591,14 @@ const server = http.createServer(async (req, res) => {
         if (recResults.length) msg.recommend = recResults;
         if (playlistCard) { playlistCard.st = 'pending'; msg.playlistCard = playlistCard; }
         broadcast('chat', msg);
+        forwardChatToRoom('ai', finalText);
         return json(res, 200, { ok: true, reply: finalText, recommend: recResults, playlist: playlistCard ? playlistCard.name : null });
       }
       if (!pendingRecs) {
         var msg2 = addChat('ai', '好友', cleanText.slice(0, 500));
         msg2.popEmoji = '💖';
         broadcast('chat', msg2);
+        forwardChatToRoom('ai', cleanText);
         return json(res, 200, { ok: true, reply: cleanText });
       }
       recMarks.forEach(function(kw) {
@@ -1643,6 +1863,197 @@ const server = http.createServer(async (req, res) => {
     const r = await transcribeAudio(b64, b.format || 'wav');
     return json(res, 200, r);
   }
+  /* ================= P8: 原生一起听 —— AI 工具 REST 端点 =================
+   *  统一身份参数 who（默认 ai，可传 human）。全部走 ltapi 函数式接口。
+   *  这些端点供插件包 packages/netease_listen.js 的 15 个 AI 工具调用。
+   * ---------------------------------------------------------------------- */
+  const _nRoom = function () {
+    try { const ds = nativeDriver.status(); if (ds && ds.roomId) return ds.roomId; } catch (e) {}
+    return state.native.roomId || state.roomId || '';
+  };
+  const _nChatRoom = function () {
+    try { const ds = nativeDriver.status(); if (ds && ds.chatRoomId) return ds.chatRoomId; } catch (e) {}
+    return state.native.chatRoomId || '';
+  };
+
+  /* 原生建房：POST /native/room/create {who?} */
+  if (p === '/native/room/create' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const r = await ltapi.createRoom(who);
+      if (r.ok) {
+        state.native.connected = true;
+        state.native.lastSyncTs = Date.now();
+        state.roomId = r.roomId;
+        state.native.roomId = r.roomId;
+        if (nativeDriver.syncMode) { try { nativeDriver.syncMode(state.mode); } catch (e) {} }
+        pushState('native_create');
+      }
+      return json(res, r.ok ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生进房/接受邀请：POST /native/accept {who?, roomId, inviterId, refer?} */
+  if (p === '/native/accept' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const r = await ltapi.acceptInvitation(who, String(b && b.roomId || ''), String(b && b.inviterId || ''), b && b.refer);
+      if (r.ok) { state.roomId = r.roomId; state.native.connected = true; pushState('native_accept'); }
+      return json(res, r.ok ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生房间状态：GET|POST /native/status {who?} */
+  if (p === '/native/status' && (req.method === 'GET' || req.method === 'POST')) {
+    try {
+      const b = req.method === 'POST' ? await readBody(req) : {};
+      const who = String((b && b.who) || 'ai');
+      const r = await ltapi.statusGet(who);
+      return json(res, 200, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* P9: 房间读消息监听控制与状态：GET/POST /native/roomwatch
+   *   body { action?:'start'|'stop'|'status', chatroomId?, roomId? } */
+  if (p === '/native/roomwatch' && (req.method === 'GET' || req.method === 'POST')) {
+    try {
+      const b = req.method === 'POST' ? await readBody(req) : {};
+      const action = String((b && b.action) || 'status');
+      if (action === 'stop') { roomWatch.stop(); _roomWatchCursor = 0; return json(res, 200, { ok: true, roomWatch: roomWatch.status() }); }
+      if (action === 'start') {
+        const ds = (function () { try { return nativeDriver.status() || {}; } catch (e) { return {}; } })();
+        const roomId = (b && b.roomId) || ds.roomId;
+        const chatroomId = (b && b.chatroomId) || ds.chatRoomId;
+        const r = await roomWatch.start({ roomId: roomId, chatroomId: chatroomId, nick: (ds.account && ds.account.nickname) || '' });
+        _roomWatchCursor = roomWatch.cursor();
+        return json(res, 200, { ok: true, result: r, roomWatch: roomWatch.status() });
+      }
+      return json(res, 200, { ok: true, roomWatch: Object.assign({}, roomWatch.status(), { lastErr: _roomWatchLastErr }) });
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e), roomWatch: roomWatch.status() }); }
+  }
+
+  /* 原生播放指令（切歌/暂停/继续）：POST /native/play {who?, roomId, action, songId?, progress?} */
+  if (p === '/native/play' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      const action = String((b && b.action) || 'play').toLowerCase();
+      const songId = b && b.songId != null ? String(b.songId) : '0';
+      const cmd = { targetSongId: songId, formerSongId: songId, progress: b && b.progress != null ? b.progress : 0 };
+      if (action === 'pause') { cmd.commandType = 'PAUSE'; cmd.playStatus = 'PAUSE'; }
+      else if (action === 'next') { cmd.commandType = 'NEXT'; cmd.playStatus = 'PLAY'; }
+      else if (action === 'prev') { cmd.commandType = 'PREV'; cmd.playStatus = 'PLAY'; }
+      else if (action === 'goto' || action === 'load') { cmd.commandType = 'GOTO'; cmd.playStatus = 'PLAY'; }
+      else { cmd.commandType = 'PLAY'; cmd.playStatus = 'PLAY'; }
+      const r = await ltapi.reportCommand(who, roomId, cmd);
+      return json(res, r.ok ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生加歌（REPLACE 全量替换）：POST /native/add_song {who?, roomId, songIds|songId, dedupe?} */
+  if (p === '/native/add_song' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      let ids = b && b.songIds;
+      if (!Array.isArray(ids)) ids = (b && b.songId != null) ? [b.songId] : [];
+      const r = await ltapi.addSongs(who, roomId, ids, { dedupe: !(b && b.dedupe === false) });
+      return json(res, r.ok ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生整单替换歌单：POST /native/replace_playlist {who?, roomId, songIds} */
+  if (p === '/native/replace_playlist' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      const list = Array.isArray(b && b.songIds) ? b.songIds : [];
+      const r = await ltapi.replaceList(who, roomId, list, {});
+      return json(res, r.ok ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生房间内发言：POST /native/say_in_room {who?, roomId, chatroomId?, text, ltType?} */
+  if (p === '/native/say_in_room' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      let chatroomId = b && b.chatroomId;
+      if (!chatroomId) {
+        const st = await ltapi.statusGet(who);
+        const info = (st && st.roomInfo) || {};
+        chatroomId = info.chatRoomId || _nChatRoom();
+      }
+      const svc = new messageLib.MessageService(who);
+      const r = await svc.sendToRoom({ chatroomId: chatroomId, text: String((b && b.text) || ''), roomId: roomId, ltType: b && b.ltType });
+      return json(res, (r && r.code === 200) ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生读房间（私信历史 + 邀请，房间内聊天无 HTTP 接口）：POST /native/read_room {who?, limit?} */
+  if (p === '/native/read_room' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const svc = new messageLib.MessageService(who);
+      const convs = await svc.conversations({ limit: b && b.limit || 30 });
+      const invites = await svc.listInvites(inviteLib);
+      return json(res, 200, { ok: true, conversations: convs.length, invites: invites, note: '房间内聊天历史无 HTTP 接口，仅能读私信/邀请' });
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 列出待处理邀请：POST /native/list_invites {who?} */
+  if (p === '/native/list_invites' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const svc = new messageLib.MessageService(who);
+      const invites = await svc.listInvites(inviteLib);
+      return json(res, 200, { ok: true, count: invites.length, invites: invites });
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生退房：POST /native/end {who?, roomId?} */
+  if (p === '/native/end' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      const r = await ltapi.endRoom(who, roomId);
+      if (r.ok) { state.native.connected = false; state.native.roomId = ''; pushState('native_end'); }
+      return json(res, r.ok ? 200 : 409, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生心跳存活判定（488=对方关房）：POST /native/heartbeat_checked {who?, roomId?} */
+  if (p === '/native/heartbeat_checked' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      const r = await ltapi.heartbeatChecked(who, roomId, b || {});
+      if (!r.alive && r.code === 488) { state.native.connected = false; state.native.roomId = ''; }
+      return json(res, 200, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
+  /* 原生同步一次（拉远端 playCommand + 歌单）：POST /native/sync_once {who?, roomId?} */
+  if (p === '/native/sync_once' && req.method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const who = String((b && b.who) || 'ai');
+      const roomId = _nRoom();
+      const r = await ltapi.syncPlaylist(who, roomId);
+      return json(res, 200, r);
+    } catch (e) { return json(res, 500, { ok: false, message: String((e && e.message) || e) }); }
+  }
+
   /* --- 健康检查/状态 --- */
   if (p === '/health') {
     return json(res, 200, { ok: true, roomId: state.roomId, clients: clients.size });
