@@ -501,6 +501,9 @@ if (_roomWatchTimer.unref) _roomWatchTimer.unref();
  *      必须走 /control 的 load 动作，由 driver.handleControl 补全信封字段。 */
 function pushSongToRoom(songId, opts) {
   const o = opts || {};
+  /* P9e: 彻底双向隔离 —— 各端独立时（playSync=false）AI 点歌不下发房间。
+   * （保留完整实现：将来 playSync=true 时可恢复 AI 操控 APP 的能力） */
+  if (state.playSync !== true) { console.log('[song→room] skip: playSync=false（各端独立）'); return; }
   let ds = {};
   try { ds = nativeDriver.status() || {}; } catch (e) {}
   if (!ds.connected || !ds.roomId) { console.log('[song→room] skip: 未接入房间'); return; }
@@ -1212,15 +1215,16 @@ const server = http.createServer(async (req, res) => {
      * 回灌（NEXT/PREV 指令不带 songId，_pullRemote 命中 `if(!cmd)return null` 直接返回），
      * 若只转发不落地，本地 state.song 永不推进 → 切歌彻底失效。故转发后继续走本地逻辑。 */
     const DUAL_WRITE_ACTIONS = ['next', 'prev'];
-    /* P9b: 播放动作的转发策略
-     *   - **AI 发起的动作（by==='ai'）永远下发房间** → AI 能操控网易云 APP 切歌/换歌。
-     *   - 手动操作（页面点击/真人，by!=='ai'）默认不下发（playSync=false），
-     *     各端独立；playSync=true 时恢复双向。
+    /* P9e: 播放动作的转发策略 —— 彻底双向隔离
+     *   - **只看 playSync 开关，不看 by（谁都不例外，AI 也不例外）**。
+     *   - playSync=false（默认）：播放动作一律不下发房间 → 插件切歌/换歌
+     *     绝不会影响网易云 APP；同时下行 applyNativeRemote/Playlist 也被
+     *     同一开关挡住 → APP 切歌/换歌也绝不会影响插件。
+     *   - playSync=true：恢复双向同步（老行为）。
      *   - 聊天/心跳/本地语义动作不受影响。 */
     const PLAY_ACTIONS = ['play', 'pause', 'toggle', 'next', 'prev', 'seek', 'load'];
     const _act = b && b.action;
-    const _byAi = String((b && b.by) || '') === 'ai';
-    const _playGated = !_byAi && (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
+    const _playGated = (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
     if (state.mode && state.mode !== 'local' && !_playGated && LOCAL_ONLY_ACTIONS.indexOf(_act) < 0) {
       try {
         const r = await nativeDriver.handleControl(b);
@@ -1786,11 +1790,9 @@ const server = http.createServer(async (req, res) => {
     pushState();
     broadcast('song_change', { song: song, playing: true, positionMs: 0 });
     trackSongRepeat(song);
-    /* P9b: AI 换歌单要同步到网易云 APP（房间真实队列整单替换 + 播放首曲）。
-     *   - by==='ai'：一定推送（AI 操控 APP 换歌单）。
-     *   - 真人/手动：playSync=true 时才推送（各端独立时不动房间）。
-     * ⚠️ REPLACE 有 3–5s 传播延迟，替换后要延迟回读确认，再下发首曲 GOTO。 */
-    var _pushPl = (by === 'ai') || (state.playSync === true);
+    /* P9e: 换歌单是否推送房间 —— 只看 playSync，不看 by（AI 也不例外）。
+     * playSync=true 时才同步到网易云 APP；默认 false 各端独立。 */
+    var _pushPl = (state.playSync === true);
     if (_pushPl) {
       try {
         var ds = {};
@@ -2468,6 +2470,8 @@ let _lastRemotePlKey = '';
 function applyNativeRemotePlaylist(songIds, playMode) {
   if (!songIds || !songIds.length) return;
   if (state.mode === 'local') return;
+  /* P9e: 各端独立时（playSync=false），APP 换歌单不回灌插件列表 */
+  if (state.playSync !== true) return;
   const key = songIds.join(',');
   if (key === _lastRemotePlKey) return;
   _lastRemotePlKey = key;
