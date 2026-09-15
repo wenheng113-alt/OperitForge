@@ -297,6 +297,35 @@ class RoomChatService {
     });
   }
 
+  /**
+   * P9q: 发送一条「自定义消息」（messageType=100），与官方 APP 同源通道。
+   * 绕开 HTTP /api/listen/together/... ，直接把 type=20000 PlayCommandMsg
+   * 投递到房间；实测可送达（history 出现 mt=100 HAS_20000）。
+   * @param {string|object} raw 字符串或对象；对象会被 JSON.stringify
+   * @returns {Promise<object>}
+   */
+  async sendCustom(raw) {
+    if (!this.instance) throw new Error('尚未 enter');
+    const body = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    const mc = this.instance.V2NIMChatroomMessageCreator;
+    if (!mc || typeof mc.createCustomMessage !== 'function') {
+      throw new Error('SDK 不支持 createCustomMessage');
+    }
+    const msg = mc.createCustomMessage(body);
+    const ms = this.instance.V2NIMChatroomMessageService;
+    return ms.sendMessage(msg);
+  }
+
+  /**
+   * P9q: 直接发送一条 PlayCommandMsg(type=20000) 播放指令。
+   * @param {object} inner content 体（serverSeq/commandType/targetSongId/... ）
+   * @returns {Promise<object>}
+   */
+  async sendPlayCommand(inner) {
+    const payload = { msgType: 120, content: { type: 20000, bizType: 3, content: inner, id: 0 } };
+    return this.sendCustom(payload);
+  }
+
   /** 退出聊天室。 */
   exit() {
     for (let i = 0; i < this._listeners.length; i += 1) {
@@ -309,6 +338,25 @@ class RoomChatService {
   }
 }
 
+/* P9q: 全局 IM 发送器 —— roomwatch 启动长连接后注册，供 driver 直发播放指令。 */
+let _globalSender = null;
+function setGlobalSender(svc) { _globalSender = svc || null; }
+function getGlobalSender() { return _globalSender; }
+
+/**
+ * P9q: 通过全局 IM 长连接直发一条 PlayCommandMsg(type=20000)。
+ * @param {object} inner content 体
+ * @returns {Promise<object>}
+ */
+async function sendPlayCommandGlobal(inner) {
+  const svc = _globalSender;
+  if (!svc || typeof svc.sendPlayCommand !== 'function') {
+    return { ok: false, message: 'no im sender' };
+  }
+  const r = await svc.sendPlayCommand(inner);
+  return { ok: true, result: r };
+}
+
 module.exports = {
   NIM_APP_KEY: NIM_APP_KEY,
   MSG_TYPE: MSG_TYPE,
@@ -316,4 +364,7 @@ module.exports = {
   parseSenderExt: parseSenderExt,
   parseMessage: parseMessage,
   RoomChatService: RoomChatService,
+  setGlobalSender: setGlobalSender,
+  getGlobalSender: getGlobalSender,
+  sendPlayCommandGlobal: sendPlayCommandGlobal,
 };

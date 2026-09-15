@@ -27,6 +27,8 @@
 const identity = require('./identity');
 /* P3: 一起听 REST 协议客户端 */
 const ltapi = require('./ltapi');
+/* P9q: IM 直发通道（与官方 APP 同源），用于绕开 HTTP 直接下发 PlayCommandMsg */
+const imLib = require('./im');
 const fs = require('fs');
 const path = require('path');
 
@@ -617,6 +619,31 @@ function createDriver() {
          * 避免"刚点的歌"被房间里的旧播放态立刻回滚（对齐 sync.js 仲裁）。 */
         status.lastUploadAt = Date.now();
         log('P3 command sent:', cmd.commandType, 'song=' + targetSongId, 'seq=' + cmd.clientSeq);
+        /* P9q: 双保险 —— HTTP 下发后再用 IM 长连接直发一条同源 PlayCommandMsg(20000)。
+         * 官方 APP 自身就是走云信「自定义消息」投递播放指令的；HTTP report 走的是
+         * 另一条链路，二者在 APP 端可能被区别对待。这里把两条都发出去，取生效的一条。 */
+        try {
+          const _inner = {
+            serverSeq: Date.now(),
+            cantShowInSongPlay: true,
+            ignoreUserIds: null,
+            onlyCanSeeUserIds: null,
+            roomId: status.roomId,
+            commandType: cmd.commandType,
+            formerSongId: cmd.formerSongId || curSongId,
+            targetSongId: cmd.targetSongId || curSongId,
+            progress: (typeof cmd.progress === 'number') ? cmd.progress : 0,
+            playStatus: cmd.playStatus || 'PLAY',
+            clientSeq: Date.now(),
+            sendUid: Number(status.creatorId) || 0,
+            pushFreq: 'client',
+            operateMsg: {},
+          };
+          const _self = this;
+          imLib.sendPlayCommandGlobal(_inner).then(function (rr) {
+            log('P9q im-direct:', cmd.commandType, 'ok=' + (rr && rr.ok) + (rr && rr.message ? (' ' + rr.message) : ''));
+          }).catch(function (e) { log('P9q im-direct err:', (e && e.message) || e); });
+        } catch (e) { log('P9q im-direct build err:', (e && e.message) || e); }
         /* P4: 下发后回读校准（异步，不阻塞响应） */
         const self = this;
         setTimeout(function () { self.syncOnce(); }, 500);

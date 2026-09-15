@@ -72,6 +72,8 @@ function createRoomWatch() {
     });
     enterTs = Date.now();
     started = true;
+    /* P9q: 注册为全局 IM 发送器，供 driver/切歌流程直发 type=20000 指令 */
+    try { im.setGlobalSender(svc); } catch (e) {}
     return { ok: true, chatroomId: chatroomId };
   }
 
