@@ -40,6 +40,12 @@ let QQ_RESOLVE_APIS = DEFAULT_QQ_RESOLVE_APIS.slice();
 const state = {
   /* P1: 接入模式 local=纯本地(现状) | duo=真人一起听(AI+真人) | solo_ai=仅AI伴听 */
   mode: 'local',
+  /* P9: 播放控制同步开关。
+   *   false（默认）= 各端独立：网易云 APP 里的切歌/换歌/暂停只在 APP 生效，
+   *                   插件内的播放操作也只在插件生效，互不干扰。
+   *   true          = 双向同步：本地操作推送进房间，APP 操作回灌本地。
+   *   ⚠️ 聊天消息不受此开关影响，始终双向同步。 */
+  playSync: false,
   native: { enabled: false, connected: false, lastError: null, lastSyncTs: 0 },
   roomId: 'bailey-' + Math.random().toString(36).slice(2, 8),
   song: null,            // {id,name,artist,album,pic,url,duration}
@@ -969,7 +975,18 @@ const server = http.createServer(async (req, res) => {
    * GET  /mode → 查当前模式与驱动状态
    * POST /mode {mode:'local'|'duo'|'solo_ai'} → 切换 */
   if (p === '/mode' && req.method === 'GET') {
-    return json(res, 200, { ok: true, mode: state.mode, roomWatch: Object.assign({}, roomWatch.status(), { lastErr: _roomWatchLastErr }), native: Object.assign({}, state.native, nativeDriver.status()) });
+    return json(res, 200, { ok: true, mode: state.mode, playSync: state.playSync === true, roomWatch: Object.assign({}, roomWatch.status(), { lastErr: _roomWatchLastErr }), native: Object.assign({}, state.native, nativeDriver.status()) });
+  }
+  /* P9: 播放控制同步开关：GET 查询 / POST {enabled:true|false} 设置。
+   *   false（默认）= 各端独立；true = 双向同步。聊天始终双向，不受此开关影响。 */
+  if (p === '/play_sync' && (req.method === 'GET' || req.method === 'POST')) {
+    if (req.method === 'POST') {
+      const b = await readBody(req);
+      state.playSync = !!(b && b.enabled);
+      state.seq++;
+      pushState('play_sync_change');
+    }
+    return json(res, 200, { ok: true, playSync: state.playSync === true });
   }
   if (p === '/mode' && req.method === 'POST') {
     const b = await readBody(req);
@@ -1161,7 +1178,12 @@ const server = http.createServer(async (req, res) => {
      * 回灌（NEXT/PREV 指令不带 songId，_pullRemote 命中 `if(!cmd)return null` 直接返回），
      * 若只转发不落地，本地 state.song 永不推进 → 切歌彻底失效。故转发后继续走本地逻辑。 */
     const DUAL_WRITE_ACTIONS = ['next', 'prev'];
-    if (state.mode && state.mode !== 'local' && LOCAL_ONLY_ACTIONS.indexOf(b && b.action) < 0) {
+    /* P9: 播放控制同步开关关闭时（playSync=false），播放类动作**不转发**到原生房间，
+     * 各端独立：APP 归 APP、插件归插件。（聊天/心跳/本地语义动作不受影响。） */
+    const PLAY_ACTIONS = ['play', 'pause', 'toggle', 'next', 'prev', 'seek', 'load'];
+    const _act = b && b.action;
+    const _playGated = (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
+    if (state.mode && state.mode !== 'local' && !_playGated && LOCAL_ONLY_ACTIONS.indexOf(_act) < 0) {
       try {
         const r = await nativeDriver.handleControl(b);
         /* 纯原生动作：原生驱动负责翻译+下发，转发即完成，直接返回 */
@@ -2221,6 +2243,7 @@ function saveState() {
   try {
     fs.writeFileSync(STATE_PATH, JSON.stringify({
       mode: state.mode,
+      playSync: state.playSync,
       song: state.song, playing: state.playing,
       positionMs: state.positionMs, anchorTs: state.anchorTs,
       playlist: state.playlist, history: state.history, playMode: state.playMode,
@@ -2234,6 +2257,7 @@ function saveStateDebounced() { clearTimeout(_saveT); _saveT = setTimeout(saveSt
 try { // 启动时恢复
   const sv = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
   if (sv && ['local', 'duo', 'solo_ai'].indexOf(sv.mode) >= 0) state.mode = sv.mode;
+  if (sv && typeof sv.playSync === 'boolean') state.playSync = sv.playSync;
   if (sv && typeof sv.playMode === 'string' && ['order', 'one', 'random'].indexOf(sv.playMode) >= 0) state.playMode = sv.playMode;
   if (sv && Array.isArray(sv.playlist)) state.playlist = sv.playlist;
   if (sv && Array.isArray(sv.history)) state.history = sv.history;
@@ -2338,6 +2362,9 @@ async function fetchRemoteSongMeta(id) {
 async function applyNativeRemote(remote) {
   if (!remote || !remote.songId) return;
   if (state.mode === 'local') return; // 纯本地模式不接管
+  /* P9: 播放控制各端独立时（playSync=false），忽略远端播放态，本地自己播自己的。
+   * （房间成员/歌单展示仍照常，只是不把 APP 的切歌/暂停打回本地播放器。） */
+  if (state.playSync !== true) return;
   const sid = String(remote.songId);
   const changed = !state.song || String(state.song.id) !== sid;
   if (changed) {
