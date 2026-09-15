@@ -577,21 +577,23 @@ function pushSongToRoom(songId, opts) {
     });
     console.log('[song→room] dispatch /control load id=' + sid + ' (inRoom=' + inRoom + ')');
   }
-  /* ① 立即切歌（不等加歌） */
-  dispatchLoad();
-  if (inRoom) return;
-  /* ② 歌不在镜像里：后台 REPLACE 进列表，成功后补发一次 GOTO
-   *    （列表外的 GOTO 会被服务端静默拒绝，故必须等列表更新后再切一次）。 */
-  ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 3, verifyDelayMs: 1500 })
+  /* ① 歌已在房间列表：立即切（reportCommand 实测 ~0.2s）。 */
+  if (inRoom) { dispatchLoad(); return; }
+  /* ② P9s: 歌不在房间列表 —— **必须先加进列表，成功后再 GOTO**。
+   *    实测：GOTO 一首不在房间歌单里的歌，APP 拉不到该歌 → 静默忽略
+   *    （这正是"第一次能切、后面不行"的根因：第一次那首恰在列表里）。
+   *    旧实现"先切后补"里那次立即 GOTO 是无效操作，反而可能干扰 APP 状态。
+   *    这里改为：addSongs(REPLACE) 且**回读验证通过**后，再下发 GOTO。 */
+  ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 4, verifyDelayMs: 1500 })
     .then(function (r) {
-      console.log('[song→room] addSongs(bg) ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
+      console.log('[song→room] addSongs ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
       if (!r || !r.ok) return;
-      /* 等列表传播稳定后补发（3.5s 覆盖 REPLACE 的 3–5s 服务端延迟） */
+      /* 等 REPLACE 在服务端传播稳定（3–5s）后再切，确保 APP 拉列表时能看到这首歌 */
       setTimeout(function () {
-        try { dispatchLoad(); console.log('[song→room] re-dispatch after add id=' + sid); } catch (e) {}
-      }, 3500);
+        try { dispatchLoad(); console.log('[song→room] dispatch after add id=' + sid); } catch (e) {}
+      }, 2500);
     })
-    .catch(function (e) { console.log('[song→room] addSongs(bg) err:', (e && e.message) || e); });
+    .catch(function (e) { console.log('[song→room] addSongs err:', (e && e.message) || e); });
 }
 
 /* P9p: 把「第三方代理」路径映射到官方 eapi 接口。

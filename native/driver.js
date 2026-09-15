@@ -550,21 +550,30 @@ function createDriver() {
        *      用递增小整数会被 APP 当成"远古时间的过期指令"直接忽略
        *      —— 这正是"指令进了房间但 APP 不刷新"的真凶。 */
       const _seqNow = Date.now();
+      /* P9s: clientSeq 在官方 PlayCommand.java 里是 **int(32位)**，毫秒时间戳(~1.78e12)
+       * 远超 int 上限(2.1e9)，会导致 APP 反序列化 PlayCommand 溢出失败 → 指令被静默丢弃
+       * （这解释了"房间 target 变了但 APP 不切"）。改用**秒级**时间戳(~1.79e9)，
+       * 既在 int 范围内、又保持单调递增。 */
+      const _clientSeq = Math.floor(_seqNow / 1000);
       /* P9r: 关键 —— 指令要以「用户(human)身份」下发。
        * 实测：用 ai cookie 下发时，服务端广播的 20000 消息 sender/sendUid = AI(10000000001)，
        * APP 看到是"对方发来的"→ 失焦/后台时只缓存不执行（u0.v0 的 audio-focus gating）。
        * 改用 human cookie 下发后，服务端广播 sender/sendUid = human(10000000002)，
        * APP 视为"我自己操作的"→ 直接执行。故这里优先 human 身份，无 human cookie 才回退 ai。 */
       const _humanUid = (status.accounts && status.accounts.human && Number(status.accounts.human.userId)) || 0;
-      let _sendWho = 'ai';
-      try { if (identity.readCookie('human')) _sendWho = 'human'; } catch (e) {}
+      let _hasHuman = false;
+      try { _hasHuman = !!identity.readCookie('human'); } catch (e) {}
+      /* P9s-fix: 一律以 AI 身份下发。APP 端 u0.v0() 用 PlayCommand.getUserId()(=sendUid) 判定：
+       *   失焦态下 sendUid==自己 → 直接丢弃；sendUid!=自己 → 缓存，回前台/恢复焦点时重放。
+       * 故 human 身份在 APP 后台时会被丢弃（P9r 的错误方向），必须用 AI 身份。 */
+      const _sendWho = 'ai';
       const cmd = {
-        clientSeq: _seqNow,
+        clientSeq: _clientSeq,
         /* P9j: 完全对齐官方抓包字段（无 clientTime / ignoreUserId）。
          * serverSeq 必须回填**房间当前值**，否则 APP 可能认为指令不对应当前房间状态。 */
         serverSeq: (status.lastRemote && Number(status.lastRemote.serverSeq)) || 0,
         triggerType: 'MANUAL',
-        userId: _humanUid || status.creatorId || undefined,
+        userId: status.creatorId || undefined,
       };
       let targetSongId = curSongId;
       let progress = curPos;

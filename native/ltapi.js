@@ -368,7 +368,7 @@ async function reportCommand(who, roomId, cmd) {
   /* P9i: 统一兜底补全信封 —— 官方客户端 clientSeq 是毫秒时间戳；
    * 缺失/为 0 会被 APP 当过期指令忽略。这里对所有调用方一次性兜底。 */
   const c = Object.assign({}, cmd || {});
-  const _t = Date.now();
+  const _t = Math.floor(Date.now() / 1000);   /* P9s: clientSeq 用秒级（官方 PlayCommand.clientSeq 是 int32） */
   if (!c.clientSeq) c.clientSeq = _t;
   if (c.playStatus === 'PLAYING') c.playStatus = 'PLAY';
   if (c.playStatus === 'PAUSED') c.playStatus = 'PAUSE';
