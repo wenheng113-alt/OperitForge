@@ -367,6 +367,34 @@ function applyToolIntent(it, opts) {
 }
 /* 确定性本地控制指令识别：短句祈使句直接落地，不依赖模型是否输出工具块。
  * 实测「暂停一下」模型只口头答应、未落地 → 这里兜底。 */
+/* P9o: 官方 eapi 搜索（走网易云官方接口，结果比第三方代理准）。
+ *   返回归一化后的 songs 数组（与第三方 /search 的 result.songs 结构对齐）。 */
+function searchSongsOfficial(keyword, limit) {
+  return new Promise(function (resolve) {
+    var cookie = '';
+    try { cookie = require('./native/identity').readCookie('ai') || ''; } catch (e) {}
+    if (!cookie) return resolve([]);
+    var api = null;
+    try { api = require('./native/ltapi'); } catch (e) { return resolve([]); }
+    api.weapiPost('/api/cloudsearch/get/web', {
+      s: String(keyword || ''), type: 1, limit: (limit || 8), offset: 0,
+    }, cookie).then(function (r) {
+      try {
+        var j = JSON.parse(r.text);
+        var ss = (j && j.result && j.result.songs) || [];
+        /* 归一化：artists/album 字段名对齐第三方（artists/album.picUrl） */
+        var out = ss.map(function (s) {
+          return {
+            id: s.id, name: s.name,
+            artists: (s.ar || []).map(function (a) { return { name: a.name }; }),
+            album: { picUrl: (s.al && s.al.picUrl) || '' },
+          };
+        });
+        resolve(out);
+      } catch (e) { resolve([]); }
+    }).catch(function () { resolve([]); });
+  });
+}
 function detectLocalCommand(text) {
   const s = String(text || '').replace(/\s/g, '');
   if (!s || s.length > 12) return null;
@@ -386,7 +414,7 @@ function extractSongQuery(text) {
   s = s.replace(/[「」【】《》""'']/g, '');
   /* 反复剥离开头的代词/意图词（「我要听XX」「帮我放XX」「来首XX」） */
   for (let i = 0; i < 5; i++) {
-    const t = s.replace(/^(我|你|他|她|咱们|我们|帮我|给我|请|麻烦|想要|我要|我想|想听|要听|听一下|放一下|想|要|来|放|换|听|切|点|再)/, '');
+    const t = s.replace(/^(我|你|他|她|咱们|我们|帮我|给我|请|麻烦|想要|我要|我想|想听|要听|听一下|放一下|想|要|来|放|换|听|切|点|再|播放|放放)/, '');
     if (t === s) break;
     s = t;
   }
@@ -1680,7 +1708,7 @@ const server = http.createServer(async (req, res) => {
             }
           } else if (_lc) {
             if (!_fromRoom) selfControl({ action: _lc, by: 'ai' });
-          } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首|换[^,。！？\s]{0,12}(歌|曲|音乐)|想听|想点|我要听|要听|来首|放首|听点|放一首|点一首|点首|唱一首|播一首|播|放歌|来点歌|换个歌手|换风格/.test(String(b.text || ''))) {
+          } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首|换[^,。！？\s]{0,12}(歌|曲|音乐)|想听|想点|我要听|要听|来首|放首|听点|放一首|点一首|点首|唱一首|播一首|放歌|来点歌|换个歌手|换风格|^听[^,。！？\s]{1,12}$|^(放|播|唱|点|来)[^,。！？\s]{1,12}$/.test(String(b.text || '').trim())) {
             /* P9m: 兜底挑新鲜的。
              * ⚠️ 若用户话里带了**歌名/歌手**（如「换陈粒的歌」「想听正版读心术」），
              *    随机挑会忽略指定对象 → 这里优先把「歌名」交给 aiSearchAndPlay。 */
@@ -1818,10 +1846,15 @@ const server = http.createServer(async (req, res) => {
   async function aiSearchAndPlay(keyword, autoplay, opts) {
     try {
       var _remoteOnly = !!(opts && opts.remoteOnly);
-      var r = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(keyword) + '&limit=8');
-      var list = (r && r.result && r.result.songs) || [];
+      /* P9o: 官方 eapi 搜索优先（第三方代理会搜错歌），失败再回退 */
+      var list = await searchSongsOfficial(keyword, 8);
+      if (!list || !list.length) {
+        var r0 = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(keyword) + '&limit=8');
+        list = (r0 && r0.result && r0.result.songs) || [];
+      }
       if (!list.length) return null;
       var sg = pickFreshSong(list);
+      console.log('[AI] search "' + keyword + '" → pick ' + sg.name + ' (id=' + sg.id + ') by ' + (((sg.artists||[]).map(function(a){return a.name}).join('/'))||''));
       /* 记录本轮 AI 点过的歌，短期内不重复推同一首 */
       if (!state._recentAiSongs) state._recentAiSongs = [];
       state._recentAiSongs.push(String(sg.id));
@@ -1861,6 +1894,9 @@ const server = http.createServer(async (req, res) => {
   /* --- AI 推荐歌曲: 只搜索不播放 --- */
   async function aiSearchSongs(keyword, limit) {
     try {
+      /* P9o: 官方优先（更准）；失败再回退第三方代理 */
+      var off = await searchSongsOfficial(keyword, limit || 3);
+      if (off && off.length) return off;
       var r = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(keyword) + '&limit=' + (limit||3));
       return (r && r.result && r.result.songs) || [];
     } catch (e) { return []; }
