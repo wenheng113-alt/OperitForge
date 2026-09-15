@@ -558,7 +558,7 @@ function createDriver() {
       /* P9y【根因确认·实测验证】指令必须以「用户(human)身份」下发。
        * 对照实验铁证（真人 APP 前台）：
        *   - AI 身份(sendUid=10000000001) 发 GOTO → APP 只弹"对方切歌了"提示，**歌不切**；
-       *   - human 身份(sendUid=10000000002) 发 GOTO → APP **真的切歌**（素颜 167827）。
+       *   - human 身份(sendUid=10000000002) 发 GOTO → APP **真的切歌**（示例歌曲）。
        * 原因：APP 的 u0.v0() 判定 PlayCommand.getUserId()(=sendUid)：
        *   - 若 != 本机登录 uid → 视为"对方发来的"→ 走「提示」路径，且失焦时仅缓存不执行；
        *   - 若 == 本机登录 uid → 视为"我自己操作的"→ 走正常执行路径，真正切歌。
