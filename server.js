@@ -548,6 +548,17 @@ function tryStartRoomWatch() {
   });
 }
 
+/* P9aa【根因确认】房间写入操作（addSongs/replaceList/reportCommand）**必须用 human 身份**。
+ * 实测铁证：用 ai cookie 写房间时，服务端广播的 sendUid=AI → APP 的 u0.v0() 判定
+ * 「对方操作」→ 只弹「对方更换了播放列表」提示、**不真正执行**；human 身份才走正常执行路径。
+ * 读取操作（syncPlaylist/statusGet）用谁都行，这里一并统一避免遗漏。 */
+function roomWho() {
+  try {
+    if (require('./native/identity').readCookie('human')) return 'human';
+  } catch (e) {}
+  return 'ai';
+}
+
 /** 轮询消费 roomwatch 缓冲 */
 function roomWatchTick() {
   try {
@@ -603,7 +614,7 @@ function pushSongToRoom(songId, opts) {
    *    （这正是"第一次能切、后面不行"的根因：第一次那首恰在列表里）。
    *    旧实现"先切后补"里那次立即 GOTO 是无效操作，反而可能干扰 APP 状态。
    *    这里改为：addSongs(REPLACE) 且**回读验证通过**后，再下发 GOTO。 */
-  ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 4, verifyDelayMs: 1500 })
+  ltapi.addSongs(roomWho(), roomId, [sid], { dedupe: true, verify: true, verifyRetries: 4, verifyDelayMs: 1500 })
     .then(function (r) {
       console.log('[song→room] addSongs ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
       if (!r || !r.ok) return;
@@ -1830,6 +1841,10 @@ const server = http.createServer(async (req, res) => {
       var raw = String(reply).slice(0, 800);
       /* P9z 诊断：打印 AI 原始输出（含 [PLAY:] 标记），定位"文案与实播不符" */
       console.log('[AI] raw reply:', JSON.stringify(raw));
+      /* P9z-fix: **提前**归一化伪标记（点歌(自动播放): X → [PLAY:X]），
+       * 必须在「兜底判断」之前执行 —— 否则兜底看到没有 [PLAY:] 会**再发一首**，
+       * 导致一次点歌变成两条指令（实测日志出现两首不同的歌接连 GOTO）。 */
+      raw = normalizePlayMarks(raw);
       /* ⓪ 确定性本地控制指令（暂停/继续/上一首/下一首）：直接落地，
        *    不依赖模型是否输出工具块（实测「暂停一下」模型只口头答应不落地）。
        *    ⚠️ 仅当模型未给出 [PLAY:] 点歌标记时才兜底，避免与「换一首」的推荐点歌冲突。 */
@@ -1858,7 +1873,7 @@ const server = http.createServer(async (req, res) => {
       /* ① 工具调用 XML → 落地为本地动作（修复「换一首」气泡空白） */
       try { extractToolIntents(raw).forEach(function (it) { applyToolIntent(it, _opts); }); } catch (e) {}
       /* ② 从展示文本中剥离工具 XML，避免气泡空白 */
-      raw = stripToolXml(normalizePlayMarks(raw));
+      raw = stripToolXml(raw);
       if (!raw) raw = '（已执行操作）';
       /* 解析 [PLAY:xxx] 和 [RECOMMEND:xxx] 标记 */
       var playMarks = [], recMarks = [], plMarks = [];
@@ -2087,10 +2102,10 @@ const server = http.createServer(async (req, res) => {
         try { ds0 = nativeDriver.status() || {}; } catch (e) {}
         if (ds0.connected && ds0.roomId) {
           var ids0 = songs.map(function (s) { return String(s.id); });
-          ltapi.replaceList('ai', ds0.roomId, ids0, { dedupe: false }).then(function () {
+          ltapi.replaceList(roomWho(), ds0.roomId, ids0, { dedupe: false }).then(function () {
             return new Promise(function (res) { setTimeout(res, 2000); });
           }).then(function () {
-            return ltapi.reportCommand('ai', ds0.roomId, {
+            return ltapi.reportCommand(roomWho(), ds0.roomId, {
               commandType: 'GOTO', targetSongId: ids0[0], formerSongId: ids0[0],
               progress: 0, playStatus: 'PLAY',
             });
@@ -2132,18 +2147,18 @@ const server = http.createServer(async (req, res) => {
         if (ds.connected && ds.roomId) {
           (function (roomId) {
             var ids = songs.map(function (s) { return String(s.id); });
-            ltapi.replaceList('ai', roomId, ids, { dedupe: false }).then(function (r) {
+            ltapi.replaceList(roomWho(), roomId, ids, { dedupe: false }).then(function (r) {
               console.log('[playlist→room] replaceList ok=' + (r && r.ok) + ' count=' + ids.length);
               /* 延迟回读确认队列已生效 */
               var tries = 0;
               (function check() {
                 tries += 1;
-                ltapi.syncPlaylist('ai', roomId).then(function (p) {
+                ltapi.syncPlaylist(roomWho(), roomId).then(function (p) {
                   var got = (p && p.songIds) || [];
                   if (got.length >= ids.length || tries >= 5) {
                     console.log('[playlist→room] observed=' + got.length + ' (want ' + ids.length + ')');
                     /* 队列生效后再 GOTO 首曲，让 APP 跟着切 */
-                    return ltapi.reportCommand('ai', roomId, {
+                    return ltapi.reportCommand(roomWho(), roomId, {
                       commandType: 'GOTO', targetSongId: ids[0], formerSongId: ids[0],
                       progress: 0, playStatus: 'PLAY',
                     }).then(function (g) { console.log('[playlist→room] GOTO first ok=' + (g && g.ok)); });
@@ -2370,7 +2385,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/native/play' && req.method === 'POST') {
     try {
       const b = await readBody(req);
-      const who = String((b && b.who) || 'ai');
+      const who = String((b && b.who) || roomWho());
       const roomId = _nRoom();
       const action = String((b && b.action) || 'play').toLowerCase();
       const songId = b && b.songId != null ? String(b.songId) : '0';
@@ -2389,7 +2404,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/native/add_song' && req.method === 'POST') {
     try {
       const b = await readBody(req);
-      const who = String((b && b.who) || 'ai');
+      const who = String((b && b.who) || roomWho());
       const roomId = _nRoom();
       let ids = b && b.songIds;
       if (!Array.isArray(ids)) ids = (b && b.songId != null) ? [b.songId] : [];
@@ -2402,7 +2417,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/native/replace_playlist' && req.method === 'POST') {
     try {
       const b = await readBody(req);
-      const who = String((b && b.who) || 'ai');
+      const who = String((b && b.who) || roomWho());
       const roomId = _nRoom();
       const list = Array.isArray(b && b.songIds) ? b.songIds : [];
       const r = await ltapi.replaceList(who, roomId, list, {});
