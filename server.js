@@ -594,13 +594,125 @@ function pushSongToRoom(songId, opts) {
     .catch(function (e) { console.log('[song→room] addSongs(bg) err:', (e && e.message) || e); });
 }
 
+/* P9p: 把「第三方代理」路径映射到官方 eapi 接口。
+ *   返回 null 表示不支持 → 回退第三方。
+ *   ⚠️ 字段结构保持与第三方一致（result.songs / data[0].url 等），调用方零改动。 */
+function _officialRoute(pathWithQuery) {
+  var q = String(pathWithQuery || '');
+  var path = q.split('?')[0];
+  var query = {};
+  q.split('?')[1] && q.split('?')[1].split('&').forEach(function (kv) {
+    var i = kv.indexOf('='); if (i > 0) query[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1));
+  });
+  var m;
+  /* 搜索：/search?keywords=&limit= → /api/cloudsearch/get/web */
+  if (path === '/search') {
+    return { path: '/api/cloudsearch/get/web', body: { s: query.keywords || '', type: query.type === '1000' ? 1000 : 1, limit: Number(query.limit || 8), offset: 0 } };
+  }
+  /* 播放链接：/song/url/v1?id=&level= → /api/song/enhance/player/url/v1 */
+  if (path === '/song/url/v1' || path === '/song/url') {
+    var ids = query.id || '';
+    return { path: '/api/song/enhance/player/url/v1', body: { ids: '[' + ids + ']', level: query.level || 'exhigh', encodeType: 'flac' } };
+  }
+  /* 歌曲详情：/song/detail?ids= → /api/v3/song/detail */
+  if (path === '/song/detail') {
+    var idList = String(query.ids || '').split(',').filter(Boolean).map(function (x) { return { id: Number(x) }; });
+    return { path: '/api/v3/song/detail', body: { c: JSON.stringify(idList) } };
+  }
+  /* 歌词：/lyric?id= → /api/song/lyric */
+  if (path === '/lyric') {
+    return { path: '/api/song/lyric', body: { id: query.id, lv: -1, kv: -1, tv: -1 } };
+  }
+  /* 歌单详情：/playlist/detail?id= → /api/v6/playlist/detail */
+  if (path === '/playlist/detail') {
+    return { path: '/api/v6/playlist/detail', body: { id: query.id, n: 1000, s: 8 } };
+  }
+  /* 歌单曲目：/playlist/track/all?id= → /api/v6/playlist/detail（取 trackIds 后再补详情） */
+  if (path === '/playlist/track/all') {
+    return { path: '/api/v6/playlist/detail', body: { id: query.id, n: 1000, s: 8 }, _playlistTracks: true };
+  }
+  /* 每日推荐：/personalized/newsong?limit= → /api/personalized/newsong */
+  if (path === '/personalized/newsong') {
+    return { path: '/api/personalized/newsong', body: { limit: Number(query.limit || 30) } };
+  }
+  /* 推荐歌单：/personalized/playlist 等 */
+  if (path === '/top/playlist') {
+    return { path: '/api/top/playlist', body: { limit: Number(query.limit || 30), order: 'hot' } };
+  }
+  return null;
+}
+/* P9p: 官方 eapi 请求 → 归一化后 resolve（失败 resolve(null) 以便回退） */
+function _fetchOfficial(pathWithQuery) {
+  return new Promise(function (resolve) {
+    var route;
+    try { route = _officialRoute(pathWithQuery); } catch (e) { return resolve(null); }
+    if (!route) return resolve(null);
+    var cookie = '';
+    try { cookie = require('./native/identity').readCookie('ai') || ''; } catch (e) {}
+    if (!cookie) return resolve(null);
+    var api = null;
+    try { api = require('./native/ltapi'); } catch (e) { return resolve(null); }
+    api.weapiPost(route.path, route.body, cookie).then(function (r) {
+      try {
+        var j = JSON.parse(r.text);
+        if (!j || (j.code !== undefined && j.code !== 200)) return resolve(null);
+        /* 歌单曲目：从 trackIds 补全歌曲详情 */
+        if (route._playlistTracks) {
+          var pl = j.playlist || {};
+          var ids = (pl.trackIds || []).slice(0, 200).map(function (t) { return t.id; });
+          if (!ids.length) return resolve({ songs: [] });
+          var c = JSON.stringify(ids.map(function (id) { return { id: id }; }));
+          return api.weapiPost('/api/v3/song/detail', { c: c }, cookie).then(function (r2) {
+            try { var j2 = JSON.parse(r2.text); resolve({ songs: (j2 && j2.songs) || [] }); }
+            catch (e) { resolve(null); }
+          }).catch(function () { resolve(null); });
+        }
+        /* 播放链接：{data:[{url,...}]} —— 与第三方结构一致，直接透传 */
+        if (route.path === '/api/song/enhance/player/url/v1') {
+          return resolve({ data: (j.data || []) });
+        }
+        /* 搜索：把 ar/al 归一化为 artists/album，兼容旧调用方 */
+        if (route.path === '/api/cloudsearch/get/web') {
+          var ss = (j.result && j.result.songs) || [];
+          var songs = ss.map(function (s) {
+            return {
+              id: s.id, name: s.name,
+              artists: (s.ar || []).map(function (a) { return { name: a.name }; }),
+              album: { picUrl: (s.al && s.al.picUrl) || '' },
+              duration: s.dt || 0,
+            };
+          });
+          /* 歌单搜索（type=1000） */
+          if (route.body.type === 1000) return resolve({ result: { playlists: (j.result && j.result.playlists) || [] } });
+          return resolve({ result: { songs: songs } });
+        }
+        /* 每日推荐：第三方返回 {result:[{song}]}，官方直接 {result:[{...}]} */
+        if (route.path === '/api/personalized/newsong') {
+          return resolve({ result: (j.result || j.data || []) });
+        }
+        /* 歌词：官方 {lrc:{lyric}} —— 与第三方一致 */
+        if (route.path === '/api/song/lyric') return resolve(j);
+        /* 歌曲详情：官方 {songs:[{al:{picUrl}}]} —— 与第三方一致 */
+        if (route.path === '/api/v3/song/detail') return resolve(j);
+        /* 歌单详情：官方 {playlist} */
+        if (route.path === '/api/v6/playlist/detail') return resolve(j);
+        if (route.path === '/api/top/playlist') return resolve(j);
+        resolve(j);
+      } catch (e) { resolve(null); }
+    }).catch(function () { resolve(null); });
+  });
+}
 function fetchUpstreamJson(pathWithQuery) {
-  return new Promise((resolve, reject) => {
-    http.get(NETEASE_API + pathWithQuery, { headers: { 'User-Agent': 'curl/7.68.0' } }, ur => {
-      let buf = '';
-      ur.on('data', c => buf += c);
-      ur.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { reject(e); } });
-    }).on('error', reject);
+  /* P9p: 官方 eapi 优先；官方不支持/失败时才回退第三方代理。 */
+  return _fetchOfficial(pathWithQuery).then(function (r) {
+    if (r !== null && r !== undefined) return r;
+    return new Promise((resolve, reject) => {
+      http.get(NETEASE_API + pathWithQuery, { headers: { 'User-Agent': 'curl/7.68.0' } }, ur => {
+        let buf = '';
+        ur.on('data', c => buf += c);
+        ur.on('end', () => { try { resolve(JSON.parse(buf)); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
   });
 }
 function proxyReq(req, res, targetPath, search) {
