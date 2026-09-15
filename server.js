@@ -343,6 +343,18 @@ function normalizePlayMarks(text) {
     function (m, kw) { return '\n[RECOMMEND:' + String(kw).trim().replace(/^\[?RECOMMEND[:：]?/i, '').replace(/\]$/, '') + ']'; });
   return s;
 }
+/* P9ab: 播放意图判定（比原正则更宽）——覆盖「切换/切到/切成/听/放/来/点/唱/播」类表达。
+ * 返回 true 表示用户确实想点歌/切歌。 */
+function hasPlayIntent(text) {
+  const s = String(text || '').trim();
+  if (!s || s.length > 30) return false;
+  const verbs = /(换|切|听|放|来|点|唱|播|要|想|整|上)/;
+  const objects = /(歌|曲|音乐|首|张|盘|碟|专辑|的)/;
+  if (verbs.test(s) && objects.test(s)) return true;
+  /* 「\u5207\u6362\u8d75\u96f7\u7684\u963f\u5204」这类：虽无「歌」字，但有 切/换 + 「的」→ 也算点歌 */
+  if (/(切换|切到|切成|切一?首|换一?首|换首|听|放|来一?首|点一?首|唱一?首|播一?首)/.test(s)) return true;
+  return false;
+}
 function stripToolXml(text) {
   let s = String(text || '');
   s = s.replace(/<(?:antml:)?function_calls[^>]*>[\s\S]*?<\/(?:antml:)?function_calls>/gi, '');
@@ -1861,7 +1873,10 @@ const server = http.createServer(async (req, res) => {
             }
           } else if (_lc) {
             if (!_fromRoom) selfControl({ action: _lc, by: 'ai' });
-          } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首|换[^,。！？\s]{0,12}(歌|曲|音乐)|想听|想点|我要听|要听|来首|放首|听点|放一首|点一首|点首|唱一首|播一首|放歌|来点歌|换个歌手|换风格|^听[^,。！？\s]{1,12}$|^(放|播|唱|点|来)[^,。！？\s]{1,12}$|^换[^,。！？\s]{1,15}$|再放一?次|重放|再来一?遍|再听一?遍|换张|换一盘/.test(String(b.text || '').trim())) {
+          } else if (hasPlayIntent(String(b.text || ''))) {
+            /* P9ab: 兜底触发条件改用 hasPlayIntent —— 覆盖「切换/切到/切成」等此前全漏的说法，
+             * 避免「AI 没给 [PLAY:] 时一条指令都不发」。 */
+            console.log('[AI] fallback triggered by text:', JSON.stringify(String(b.text || '').slice(0, 60)));
             /* P9m: 兜底挑新鲜的。
              * ⚠️ 若用户话里带了**歌名/歌手**（如「换陈粒的歌」「想听正版读心术」），
              *    随机挑会忽略指定对象 → 这里优先把「歌名」交给 aiSearchAndPlay。 */
