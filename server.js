@@ -348,7 +348,7 @@ function selfControl(body) {
     r.end();
   } catch (e) {}
 }
-function applyToolIntent(it) {
+function applyToolIntent(it, opts) {
   try {
     const tool = String((it && it.tool) || '');
     const p = (it && it.params) || {};
@@ -361,7 +361,7 @@ function applyToolIntent(it) {
       }
     } else if (/play_song|play_from_favorite/.test(tool)) {
       const kw = p.keyword || p.song_name || p.song_id;
-      if (kw) { try { aiSearchAndPlay(String(kw), true); } catch (e) {} }
+      if (kw) { try { aiSearchAndPlay(String(kw), true, opts); } catch (e) {} }
     }
   } catch (e) {}
 }
@@ -442,13 +442,14 @@ function handleRoomHumanMessage(m) {
     msg.fromRoom = true;
     broadcast('chat', msg);
     /* ② 触发 AI 回复：走本地 /ai/chat，复用完整链路（点歌/推荐/身份转发） */
-    selfPostChat(text);
+    selfPostChat(text, true);
   } catch (e) { console.log('[roomwatch] handle error:', (e && e.message) || e); }
 }
 
 /** 向本机 /ai/chat 发一条消息（用于把房间消息喂给 AI），不阻塞 */
-function selfPostChat(text) {
-  const body = JSON.stringify({ text: String(text || '').slice(0, 500) });
+function selfPostChat(text, fromRoom) {
+  /* P9g: fromRoom=true → AI 知道这是「APP 里说的话」，换歌只动 APP，不动插件本地。 */
+  const body = JSON.stringify({ text: String(text || '').slice(0, 500), fromRoom: !!fromRoom });
   const req = http.request({
     host: '127.0.0.1', port: PORT, path: '/ai/chat', method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
@@ -1549,6 +1550,11 @@ const server = http.createServer(async (req, res) => {
   /* --- AI 聊天 --- */
   if (p === '/ai/chat' && req.method === 'POST') {
     const b = await readBody(req);
+    /* P9g: 消息来源 —— fromRoom=true 表示来自网易云 APP 房间。
+     * 在 APP 里让 AI 换歌 → 只换 APP，插件本地不动（remoteOnly）。
+     * 在插件聊天框说 → 换插件（同时也推 APP，符合「插件里说就切插件」）。 */
+    const _fromRoom = !!b.fromRoom;
+    const _opts = { remoteOnly: _fromRoom };
     if (!aiConfig.endpoint || !aiConfig.apiKey || !aiConfig.model) return json(res, 200, { ok: false, error: '请先配置模型' });
     const recent = chatLog.slice(-10).filter(m => m.text).map(m => ({
       role: m.from === 'me' || m.from === 'host' ? 'user' : 'assistant',
@@ -1620,20 +1626,24 @@ const server = http.createServer(async (req, res) => {
       try {
         if (!/\[PLAY:[^\]]+\]/.test(raw)) {
           var _lc = detectLocalCommand(b.text);
-          /* 切歌手势（下一首/换一首…）：本地推进 + 让 AI 挑一首新鲜的上行到 APP */
+          /* P9g: 来自 APP 房间时只操控 APP（remoteOnly），插件本地不动 */
           if (_lc === 'next') {
-            selfControl({ action: 'next', by: 'ai' });
-            try { aiPlayRandomFresh(); } catch (e) {}
+            if (_fromRoom) {
+              try { aiPlayRandomFresh({ remoteOnly: true }); } catch (e) {}
+            } else {
+              selfControl({ action: 'next', by: 'ai' });
+              try { aiPlayRandomFresh(); } catch (e) {}
+            }
           } else if (_lc) {
-            selfControl({ action: _lc, by: 'ai' });
+            if (!_fromRoom) selfControl({ action: _lc, by: 'ai' });
           } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首/.test(String(b.text || ''))) {
-            /* 自然语言换歌意图但模型没给标记 → 兜底挑新鲜的 */
-            try { aiPlayRandomFresh(); } catch (e) {}
+            /* 自然语言换歌意图但模型没给标记 → 兜底挑新鲜的（APP 来源只换 APP） */
+            try { aiPlayRandomFresh(_opts); } catch (e) {}
           }
         }
       } catch (e) {}
       /* ① 工具调用 XML → 落地为本地动作（修复「换一首」气泡空白） */
-      try { extractToolIntents(raw).forEach(applyToolIntent); } catch (e) {}
+      try { extractToolIntents(raw).forEach(function (it) { applyToolIntent(it, _opts); }); } catch (e) {}
       /* ② 从展示文本中剥离工具 XML，避免气泡空白 */
       raw = stripToolXml(raw);
       if (!raw) raw = '（已执行操作）';
@@ -1652,7 +1662,7 @@ const server = http.createServer(async (req, res) => {
       /* 执行点歌(自动播放) */
       playMarks.forEach(function(kw, i) {
         setTimeout(function() {
-          aiSearchAndPlay(kw, true);
+          aiSearchAndPlay(kw, true, _opts);
         }, i * 2000);
       });
       /* 处理推荐歌曲 + 整单推荐 - 异步搜索后附到消息 */
@@ -1689,7 +1699,11 @@ const server = http.createServer(async (req, res) => {
         resolvePlaylistByKeyword(kw).then(function(pl) {
           if (pl && pl.songs && pl.songs.length) {
             var card = buildPendingPlaylist(pl.name, pl.songs);
-            if (card) playlistCard = card;
+            if (_fromRoom) {
+              /* P9g: APP 来源直接换 APP 歌单，插件不动（也不弹插件确认卡） */
+              playlistCard = null;
+              try { applyPlaylistReplace('ai', { remoteOnly: true }); } catch (e) {}
+            } else if (card) playlistCard = card;
           }
           pendingRecs--;
           if (pendingRecs <= 0) finishMsg();
@@ -1722,7 +1736,7 @@ const server = http.createServer(async (req, res) => {
   }
   /* --- P9f: 自动挑一首"新鲜的"歌并播放（用于「换一首」但 AI 没给 [PLAY:] 标记时的兜底）。
    *  多源候选：个性化新歌 → 关键词池搜索；配合 pickFreshSong 避开最近播放。 */
-  async function aiPlayRandomFresh() {
+  async function aiPlayRandomFresh(opts) {
     var pool = ['华语流行', '欧美流行', '轻音乐', '民谣', '粤语经典', '爵士', '电子', '古风', 'R&B', '摇滚'];
     var candidates = [];
     try {
@@ -1742,11 +1756,14 @@ const server = http.createServer(async (req, res) => {
     if (!sg) return null;
     var ar = ((sg.artists || sg.ar || []).map(function (a) { return a.name; }).join('/')) || sg.artist || '';
     var kw2 = (sg.name || '') + (ar ? ' ' + ar.split('/')[0] : '');
-    return await aiSearchAndPlay(kw2, true);
+    return await aiSearchAndPlay(kw2, true, opts);
   }
-  /* --- AI 智能点歌: 搜索并自动播放 --- */
-  async function aiSearchAndPlay(keyword, autoplay) {
+  /* --- AI 智能点歌: 搜索并自动播放 ---
+   * P9g: opts.remoteOnly=true → **只操控网易云 APP，不改插件本地**。
+   *      用于「在 APP 里让 AI 换歌」——只换 APP 的歌，插件保持原样。 */
+  async function aiSearchAndPlay(keyword, autoplay, opts) {
     try {
+      var _remoteOnly = !!(opts && opts.remoteOnly);
       var r = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(keyword) + '&limit=8');
       var list = (r && r.result && r.result.songs) || [];
       if (!list.length) return null;
@@ -1765,6 +1782,12 @@ const server = http.createServer(async (req, res) => {
         try { var dd = await fetchUpstreamJson('/song/detail?ids=' + sg.id); var al = (dd&&dd.songs&&dd.songs[0]&&dd.songs[0].al)||{}; pic = al.picUrl||''; } catch(e){}
       }
       var song = { id: String(sg.id), name: sg.name||'未知', artist: ar, pic: pic, url: d.url, duration: d.time||sg.duration||0 };
+      if (_remoteOnly) {
+        /* P9g: 只推 APP，插件本地一字不改（这就是「在 APP 让 AI 换歌不同步到插件」） */
+        pushSongToRoom(song.id, { playing: autoplay !== false, name: song.name, artist: song.artist });
+        console.log('[AI] remoteOnly play → APP only:', song.name);
+        return song;
+      }
       /* 注入到 state 并广播 */
       if (state.song) pushHistory(state.song);
       state.song = song;
@@ -1824,10 +1847,31 @@ const server = http.createServer(async (req, res) => {
     return { name: state.pendingPlaylist.name, count: uniq.length, songs: uniq.slice(0, 6) };
   }
   /* --- 执行整单替换: 清空队列 + 灌入 + 播放第一首 --- */
-  async function applyPlaylistReplace(by) {
+  async function applyPlaylistReplace(by, opts) {
     var pend = state.pendingPlaylist;
     if (!pend || !pend.songs || !pend.songs.length) return null;
     var songs = pend.songs;
+    /* P9g: 来自 APP 聊天室时只换 APP 歌单，插件本地不动 */
+    if (opts && opts.remoteOnly) {
+      state.pendingPlaylist = null;
+      try {
+        var ds0 = {};
+        try { ds0 = nativeDriver.status() || {}; } catch (e) {}
+        if (ds0.connected && ds0.roomId) {
+          var ids0 = songs.map(function (s) { return String(s.id); });
+          ltapi.replaceList('ai', ds0.roomId, ids0, { dedupe: false }).then(function () {
+            return new Promise(function (res) { setTimeout(res, 2000); });
+          }).then(function () {
+            return ltapi.reportCommand('ai', ds0.roomId, {
+              commandType: 'GOTO', targetSongId: ids0[0], formerSongId: ids0[0],
+              progress: 0, playStatus: 'PLAY',
+            });
+          }).then(function () { console.log('[playlist→room] remoteOnly ok, count=' + ids0.length); })
+            .catch(function (e) { console.log('[playlist→room] remoteOnly err:', (e && e.message) || e); });
+        }
+      } catch (e) {}
+      return { count: songs.length, first: songs[0], remoteOnly: true };
+    }
     state.playlist = songs.map(function(s){ return Object.assign({ played: false }, s); });
     state.pendingPlaylist = null;
     var first = songs[0];
