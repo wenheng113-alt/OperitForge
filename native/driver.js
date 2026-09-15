@@ -550,11 +550,11 @@ function createDriver() {
        *      用递增小整数会被 APP 当成"远古时间的过期指令"直接忽略
        *      —— 这正是"指令进了房间但 APP 不刷新"的真凶。 */
       const _seqNow = Date.now();
-      /* P9s: clientSeq 在官方 PlayCommand.java 里是 **int(32位)**，毫秒时间戳(~1.78e12)
-       * 远超 int 上限(2.1e9)，会导致 APP 反序列化 PlayCommand 溢出失败 → 指令被静默丢弃
-       * （这解释了"房间 target 变了但 APP 不切"）。改用**秒级**时间戳(~1.79e9)，
-       * 既在 int 范围内、又保持单调递增。 */
-      const _clientSeq = Math.floor(_seqNow / 1000);
+      /* P9ah: clientSeq 用**毫秒**时间戳 —— 对齐《一起听改造计划书 v0.4》§3.4
+       * Frida 真机抓包（"clientSeq": 1789390650760，13 位毫秒）。
+       * P9s 曾因「PlayCommand.clientSeq 是 Java int32」改秒级，但那只适用云信 IM
+       * 通道（Java 反序列化）；HTTP 通道的 commandInfo 是 JSON 字符串，官方实测就是毫秒。 */
+      const _clientSeq = _seqNow;
       /* P9y【根因确认·实测验证】指令必须以「用户(human)身份」下发。
        * 对照实验铁证（真人 APP 前台）：
        *   - AI 身份(sendUid=10000000001) 发 GOTO → APP 只弹"对方切歌了"提示，**歌不切**；

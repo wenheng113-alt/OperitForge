@@ -368,26 +368,25 @@ async function reportCommand(who, roomId, cmd) {
   /* P9i: 统一兜底补全信封 —— 官方客户端 clientSeq 是毫秒时间戳；
    * 缺失/为 0 会被 APP 当过期指令忽略。这里对所有调用方一次性兜底。 */
   const c = Object.assign({}, cmd || {});
-  const _t = Math.floor(Date.now() / 1000);   /* P9s: clientSeq 用秒级（官方 PlayCommand.clientSeq 是 int32） */
+  /* P9ah: clientSeq 用**毫秒**时间戳 —— 对齐《一起听改造计划书 v0.4》§3.4 的
+   * Frida 真机抓包（"clientSeq": 1789390650760，13 位毫秒）。
+   * P9s 曾因「PlayCommand.clientSeq 是 Java int32」改成秒级，但那只适用于
+   * 云信 IM 通道（Java 反序列化 int）；HTTP 通道的 commandInfo 是 JSON 字符串，
+   * 服务端不按 int32 解析，官方抓包实测就是毫秒。 */
+  const _t = Date.now();
   if (!c.clientSeq) c.clientSeq = _t;
   if (c.playStatus === 'PLAYING') c.playStatus = 'PLAY';
   if (c.playStatus === 'PAUSED') c.playStatus = 'PAUSE';
   delete c.clientTime;   // P9j: 官方抓包无此字段，去掉以完全对齐
-  /* P9ag【漏参数修复】—— 逐字段对齐 APP 真实报文（roomwatch dump 到的 IM type=100 content）：
-   *   APP 实际下发字段：serverSeq/cantShowInSongPlay/ignoreUserIds/onlyCanSeeUserIds/roomId/
-   *                     commandType/formerSongId/targetSongId/progress/playStatus/clientSeq/
-   *                     sendUid/pushFreq/operateMsg
-   *   我们此前**漏了** cantShowInSongPlay/ignoreUserIds/onlyCanSeeUserIds/roomId/pushFreq，
-   *   且**多了** triggerType（APP 无此字段）→ 服务端虽返回 result:true（假成功），
-   *   APP 却因报文不完整/字段异常而不执行。
-   *   另外 APP 用 sendUid 而非 userId —— 补上 sendUid 双写。 */
-  if (c.cantShowInSongPlay === undefined) c.cantShowInSongPlay = true;
-  if (c.ignoreUserIds === undefined) c.ignoreUserIds = null;
-  if (c.onlyCanSeeUserIds === undefined) c.onlyCanSeeUserIds = null;
-  if (!c.roomId) c.roomId = roomId;
-  if (!c.pushFreq) c.pushFreq = 'client';
-  delete c.triggerType;   // P9ag: APP 报文无此字段
-  if (c.userId !== undefined && c.sendUid === undefined) c.sendUid = c.userId;  // 双写 sendUid
+  /* P9ah【回滚 P9ag 误改】—— 切歌走的是 HTTP /api/listen/together/play/command/report，
+   * 其正确载荷形态以《一起听改造计划书 v0.4》§3.4 的 Frida 真机抓包为准（仅 9 字段）：
+   *   { clientSeq, commandType, formerSongId, playStatus, progress,
+   *     serverSeq, targetSongId, triggerType:'MANUAL', userId }
+   * P9ag 误把**云信 IM type=100 通道**的报文（多出 cantShowInSongPlay/ignoreUserIds/
+   * onlyCanSeeUserIds/roomId/pushFreq/operateMsg/sendUid，且无 triggerType）套到了 HTTP 通道，
+   * 字段形态不符 → 服务端 result:true 但 APP 不执行（假成功）。
+   * 现恢复 §3.4 形态：保留 triggerType、用 userId、不再补 IM 专有字段。 */
+  if (c.triggerType === undefined) c.triggerType = 'MANUAL';
   const info = JSON.stringify(c);
   const r = await weapiPost('/api/listen/together/play/command/report', { roomId: roomId, commandInfo: info }, cookie);
   const j = parse(r.text);
