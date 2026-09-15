@@ -501,9 +501,8 @@ if (_roomWatchTimer.unref) _roomWatchTimer.unref();
  *      必须走 /control 的 load 动作，由 driver.handleControl 补全信封字段。 */
 function pushSongToRoom(songId, opts) {
   const o = opts || {};
-  /* P9e: 彻底双向隔离 —— 各端独立时（playSync=false）AI 点歌不下发房间。
-   * （保留完整实现：将来 playSync=true 时可恢复 AI 操控 APP 的能力） */
-  if (state.playSync !== true) { console.log('[song→room] skip: playSync=false（各端独立）'); return; }
+  /* P9f: AI 点歌 → 推送到网易云 APP（这就是「在 APP 里让 AI 切歌」能生效的关键）。
+   * 手动路径不会走到这里，所以插件 UI 依旧不影响 APP。 */
   let ds = {};
   try { ds = nativeDriver.status() || {}; } catch (e) {}
   if (!ds.connected || !ds.roomId) { console.log('[song→room] skip: 未接入房间'); return; }
@@ -1215,16 +1214,17 @@ const server = http.createServer(async (req, res) => {
      * 回灌（NEXT/PREV 指令不带 songId，_pullRemote 命中 `if(!cmd)return null` 直接返回），
      * 若只转发不落地，本地 state.song 永不推进 → 切歌彻底失效。故转发后继续走本地逻辑。 */
     const DUAL_WRITE_ACTIONS = ['next', 'prev'];
-    /* P9e: 播放动作的转发策略 —— 彻底双向隔离
-     *   - **只看 playSync 开关，不看 by（谁都不例外，AI 也不例外）**。
-     *   - playSync=false（默认）：播放动作一律不下发房间 → 插件切歌/换歌
-     *     绝不会影响网易云 APP；同时下行 applyNativeRemote/Playlist 也被
-     *     同一开关挡住 → APP 切歌/换歌也绝不会影响插件。
-     *   - playSync=true：恢复双向同步（老行为）。
+    /* P9f: 播放动作的转发策略 —— 双向语义隔离（修正 P9e 的一刀切）
+     *   - **AI 发起的动作（by==='ai'）下发房间** → 在 APP 里说「换首歌」、
+     *     在插件聊天框说「换首歌」，AI 都能真的操控网易云 APP 切歌/换歌。
+     *   - 手动操作（插件 UI 点击，by='用户'）不下发 → 插件归插件，不动 APP。
+     *   - 下行（APP 手动 → 插件）由 applyNativeRemote / Playlist 的 playSync
+     *     守卫挡住 → APP 归 APP，不动插件。
      *   - 聊天/心跳/本地语义动作不受影响。 */
     const PLAY_ACTIONS = ['play', 'pause', 'toggle', 'next', 'prev', 'seek', 'load'];
     const _act = b && b.action;
-    const _playGated = (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
+    const _byAi = String((b && b.by) || '') === 'ai';
+    const _playGated = !_byAi && (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
     if (state.mode && state.mode !== 'local' && !_playGated && LOCAL_ONLY_ACTIONS.indexOf(_act) < 0) {
       try {
         const r = await nativeDriver.handleControl(b);
@@ -1603,6 +1603,8 @@ const server = http.createServer(async (req, res) => {
       + '示例: "推荐几首适合写作业的~ [RECOMMEND:轻音乐 纯音乐 学习]"\n'
       + '示例: "给你挑了张歌单，确认就整单换上~ [PLAYLIST:华语 经典]"\n'
       + '可以同时推荐多首，每行一个标记。其余部分正常聊天即可。如果没有点歌需求就别加标记。\n'
+      + '【换歌偏好】当用户说「换一首」「来点别的」「随便放」这类没指定歌名时，'
+      + '请尽量换**不同歌手/不同风格**的歌，避免总是推那几首；已经推荐过的就别再推。'
       + '\n【重要·格式约束】你是在播放器聊天框里说话，**只能输出纯文本**。'
       + '禁止输出任何工具调用/函数调用/XML 标签（如 <function_calls>、<invoke>、<parameter>、antml: 等），'
       + '也不要输出 ``` 代码块。想切歌/暂停/播放请直接用 [PLAY:关键词] 标记，或直接说「下一首」即可，'
@@ -1618,7 +1620,16 @@ const server = http.createServer(async (req, res) => {
       try {
         if (!/\[PLAY:[^\]]+\]/.test(raw)) {
           var _lc = detectLocalCommand(b.text);
-          if (_lc) selfControl({ action: _lc, by: 'ai' });
+          /* 切歌手势（下一首/换一首…）：本地推进 + 让 AI 挑一首新鲜的上行到 APP */
+          if (_lc === 'next') {
+            selfControl({ action: 'next', by: 'ai' });
+            try { aiPlayRandomFresh(); } catch (e) {}
+          } else if (_lc) {
+            selfControl({ action: _lc, by: 'ai' });
+          } else if (/换首|换一?首|切歌|来点?新|换个|换一?个歌|下首|随便放|放点|来一首/.test(String(b.text || ''))) {
+            /* 自然语言换歌意图但模型没给标记 → 兜底挑新鲜的 */
+            try { aiPlayRandomFresh(); } catch (e) {}
+          }
         }
       } catch (e) {}
       /* ① 工具调用 XML → 落地为本地动作（修复「换一首」气泡空白） */
@@ -1688,13 +1699,62 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* --- P9f: 从候选里挑一首"新鲜"的歌：优先没播过、不在播放列表、没在本轮推荐过的。
+   *  解决「AI 切来切去总是那几首」——之前 limit=1 永远取搜索结果第一首。 */
+  function pickFreshSong(list) {
+    if (!list || !list.length) return null;
+    var recent = {};
+    (state.history || []).slice(-15).forEach(function (s) { if (s && s.id) recent[String(s.id)] = 1; });
+    if (state.song && state.song.id) recent[String(state.song.id)] = 1;
+    var inPl = {};
+    (state.playlist || []).forEach(function (s) { if (s && s.id) inPl[String(s.id)] = 1; });
+    if (state._recentAiSongs) state._recentAiSongs.forEach(function (id) { recent[String(id)] = 1; });
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      var sid = String(s.id);
+      if (!recent[sid] && !inPl[sid]) return s;   // 最理想：全新
+    }
+    for (var j = 0; j < list.length; j++) {          // 退一步：不在最近播放即可（哪怕在列表里）
+      var s2 = list[j], sid2 = String(s2.id);
+      if (!recent[sid2]) return s2;
+    }
+    return list[0];
+  }
+  /* --- P9f: 自动挑一首"新鲜的"歌并播放（用于「换一首」但 AI 没给 [PLAY:] 标记时的兜底）。
+   *  多源候选：个性化新歌 → 关键词池搜索；配合 pickFreshSong 避开最近播放。 */
+  async function aiPlayRandomFresh() {
+    var pool = ['华语流行', '欧美流行', '轻音乐', '民谣', '粤语经典', '爵士', '电子', '古风', 'R&B', '摇滚'];
+    var candidates = [];
+    try {
+      var nr = await fetchUpstreamJson('/personalized/newsong?limit=30');
+      var arr = (nr && (nr.result || nr.data)) || [];
+      arr.forEach(function (it) { var s = it && (it.song || it); if (s && s.id) candidates.push(s); });
+    } catch (e) {}
+    if (candidates.length < 4) {
+      var kw = pool[Math.floor(Math.random() * pool.length)];
+      try {
+        var sr = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(kw) + '&limit=12');
+        ((sr && sr.result && sr.result.songs) || []).forEach(function (s) { if (s && s.id) candidates.push(s); });
+      } catch (e) {}
+    }
+    if (!candidates.length) return null;
+    var sg = pickFreshSong(candidates);
+    if (!sg) return null;
+    var ar = ((sg.artists || sg.ar || []).map(function (a) { return a.name; }).join('/')) || sg.artist || '';
+    var kw2 = (sg.name || '') + (ar ? ' ' + ar.split('/')[0] : '');
+    return await aiSearchAndPlay(kw2, true);
+  }
   /* --- AI 智能点歌: 搜索并自动播放 --- */
   async function aiSearchAndPlay(keyword, autoplay) {
     try {
-      var r = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(keyword) + '&limit=1');
+      var r = await fetchUpstreamJson('/search?keywords=' + encodeURIComponent(keyword) + '&limit=8');
       var list = (r && r.result && r.result.songs) || [];
       if (!list.length) return null;
-      var sg = list[0];
+      var sg = pickFreshSong(list);
+      /* 记录本轮 AI 点过的歌，短期内不重复推同一首 */
+      if (!state._recentAiSongs) state._recentAiSongs = [];
+      state._recentAiSongs.push(String(sg.id));
+      if (state._recentAiSongs.length > 20) state._recentAiSongs.shift();
       var ur = await fetchUpstreamJson('/song/url/v1?id=' + sg.id + '&level=exhigh');
       var d = (ur && ur.data && ur.data[0]) || {};
       if (!d.url) { ur = await fetchUpstreamJson('/song/url/v1?id=' + sg.id + '&level=standard'); d = (ur&&ur.data&&ur.data[0])||{}; }
@@ -1790,9 +1850,9 @@ const server = http.createServer(async (req, res) => {
     pushState();
     broadcast('song_change', { song: song, playing: true, positionMs: 0 });
     trackSongRepeat(song);
-    /* P9e: 换歌单是否推送房间 —— 只看 playSync，不看 by（AI 也不例外）。
-     * playSync=true 时才同步到网易云 APP；默认 false 各端独立。 */
-    var _pushPl = (state.playSync === true);
+    /* P9f: 换歌单是否推送房间 —— AI 换歌单一定推（AI 操控 APP），
+     * 手动（by='用户'）仅 playSync=true 时才推。 */
+    var _pushPl = (by === 'ai') || (state.playSync === true);
     if (_pushPl) {
       try {
         var ds = {};
@@ -2297,7 +2357,7 @@ if (!aiConfig._userCustomized) {
 }
 function saveAiConfig() { try { fs.writeFileSync(AI_CONFIG_PATH, JSON.stringify(aiConfig, null, 2)); } catch(e) {} }
 function callLLM(messages, cb) {
-  const body = JSON.stringify({ model: aiConfig.model, messages, max_tokens: 1024, temperature: 0.8, stream: false });
+  const body = JSON.stringify({ model: aiConfig.model, messages, max_tokens: 1024, temperature: 0.95, stream: false });
   let endpoint = aiConfig.endpoint;
   if (!endpoint.endsWith('/chat/completions')) { if (endpoint.charAt(endpoint.length-1)==='/') endpoint=endpoint.slice(0,-1); endpoint += '/chat/completions'; }
   const url = new URL(endpoint);
