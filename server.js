@@ -492,6 +492,36 @@ function roomWatchTick() {
 _roomWatchTimer = setInterval(function () { tryStartRoomWatch(); roomWatchTick(); }, 2000);
 if (_roomWatchTimer.unref) _roomWatchTimer.unref();
 
+/* P9b: 把「AI 点歌」推送到网易云房间（AI 操控 APP 切歌）。
+ * ⚠️ 顺序坑（实测）：必须先 addSongs 并**等它真正生效**（REPLACE 有 3–5s 服务端传播延迟），
+ *    再下发 GOTO；否则 GOTO 指向一首「还不在房间里」的歌会被服务端忽略。 */
+function pushSongToRoom(songId, opts) {
+  const o = opts || {};
+  let ds = {};
+  try { ds = nativeDriver.status() || {}; } catch (e) {}
+  if (!ds.connected || !ds.roomId) { console.log('[song→room] skip: 未接入房间'); return; }
+  const sid = String(songId);
+  const roomId = ds.roomId;
+  const playing = o.playing !== false;
+  ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 6, verifyDelayMs: 1500 })
+    .then(function (r) {
+      console.log('[song→room] addSongs ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
+      /* 等列表传播稳定后再下发播放指令 */
+      return new Promise(function (res) { setTimeout(res, 1800); });
+    })
+    .then(function () {
+      return ltapi.reportCommand('ai', roomId, {
+        commandType: playing ? 'GOTO' : 'PAUSE',
+        targetSongId: sid,
+        formerSongId: sid,
+        progress: 0,
+        playStatus: playing ? 'PLAY' : 'PAUSE',
+      });
+    })
+    .then(function (r) { console.log('[song→room] reportCommand ok=' + (r && r.ok)); })
+    .catch(function (e) { console.log('[song→room] err:', (e && e.message) || e); });
+}
+
 function fetchUpstreamJson(pathWithQuery) {
   return new Promise((resolve, reject) => {
     http.get(NETEASE_API + pathWithQuery, { headers: { 'User-Agent': 'curl/7.68.0' } }, ur => {
@@ -1178,11 +1208,15 @@ const server = http.createServer(async (req, res) => {
      * 回灌（NEXT/PREV 指令不带 songId，_pullRemote 命中 `if(!cmd)return null` 直接返回），
      * 若只转发不落地，本地 state.song 永不推进 → 切歌彻底失效。故转发后继续走本地逻辑。 */
     const DUAL_WRITE_ACTIONS = ['next', 'prev'];
-    /* P9: 播放控制同步开关关闭时（playSync=false），播放类动作**不转发**到原生房间，
-     * 各端独立：APP 归 APP、插件归插件。（聊天/心跳/本地语义动作不受影响。） */
+    /* P9b: 播放动作的转发策略
+     *   - **AI 发起的动作（by==='ai'）永远下发房间** → AI 能操控网易云 APP 切歌/换歌。
+     *   - 手动操作（页面点击/真人，by!=='ai'）默认不下发（playSync=false），
+     *     各端独立；playSync=true 时恢复双向。
+     *   - 聊天/心跳/本地语义动作不受影响。 */
     const PLAY_ACTIONS = ['play', 'pause', 'toggle', 'next', 'prev', 'seek', 'load'];
     const _act = b && b.action;
-    const _playGated = (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
+    const _byAi = String((b && b.by) || '') === 'ai';
+    const _playGated = !_byAi && (state.playSync !== true) && PLAY_ACTIONS.indexOf(_act) >= 0;
     if (state.mode && state.mode !== 'local' && !_playGated && LOCAL_ONLY_ACTIONS.indexOf(_act) < 0) {
       try {
         const r = await nativeDriver.handleControl(b);
@@ -1673,6 +1707,8 @@ const server = http.createServer(async (req, res) => {
       state.seq++;
       pushState();
       broadcast('song_change', { song: song, playing: state.playing, positionMs: 0 }); trackSongRepeat(song);
+      /* P9b: AI 点歌同步到网易云 APP（房间加歌 + 下发播放指令） */
+      pushSongToRoom(song.id, { playing: state.playing });
       return song;
     } catch (e) { console.log('[AI] play error:', e.message); return null; }
   }
@@ -1746,6 +1782,42 @@ const server = http.createServer(async (req, res) => {
     pushState();
     broadcast('song_change', { song: song, playing: true, positionMs: 0 });
     trackSongRepeat(song);
+    /* P9b: AI 换歌单要同步到网易云 APP（房间真实队列整单替换 + 播放首曲）。
+     *   - by==='ai'：一定推送（AI 操控 APP 换歌单）。
+     *   - 真人/手动：playSync=true 时才推送（各端独立时不动房间）。
+     * ⚠️ REPLACE 有 3–5s 传播延迟，替换后要延迟回读确认，再下发首曲 GOTO。 */
+    var _pushPl = (by === 'ai') || (state.playSync === true);
+    if (_pushPl) {
+      try {
+        var ds = {};
+        try { ds = nativeDriver.status() || {}; } catch (e) {}
+        if (ds.connected && ds.roomId) {
+          (function (roomId) {
+            var ids = songs.map(function (s) { return String(s.id); });
+            ltapi.replaceList('ai', roomId, ids, { dedupe: false }).then(function (r) {
+              console.log('[playlist→room] replaceList ok=' + (r && r.ok) + ' count=' + ids.length);
+              /* 延迟回读确认队列已生效 */
+              var tries = 0;
+              (function check() {
+                tries += 1;
+                ltapi.syncPlaylist('ai', roomId).then(function (p) {
+                  var got = (p && p.songIds) || [];
+                  if (got.length >= ids.length || tries >= 5) {
+                    console.log('[playlist→room] observed=' + got.length + ' (want ' + ids.length + ')');
+                    /* 队列生效后再 GOTO 首曲，让 APP 跟着切 */
+                    return ltapi.reportCommand('ai', roomId, {
+                      commandType: 'GOTO', targetSongId: ids[0], formerSongId: ids[0],
+                      progress: 0, playStatus: 'PLAY',
+                    }).then(function (g) { console.log('[playlist→room] GOTO first ok=' + (g && g.ok)); });
+                  }
+                  return new Promise(function (res) { setTimeout(res, 1500); }).then(check);
+                });
+              })();
+            }).catch(function (e) { console.log('[playlist→room] error:', (e && e.message) || e); });
+          })(ds.roomId);
+        }
+      } catch (e) {}
+    }
     return { first: song, count: songs.length };
   }
 
