@@ -373,6 +373,21 @@ async function reportCommand(who, roomId, cmd) {
   if (c.playStatus === 'PLAYING') c.playStatus = 'PLAY';
   if (c.playStatus === 'PAUSED') c.playStatus = 'PAUSE';
   delete c.clientTime;   // P9j: 官方抓包无此字段，去掉以完全对齐
+  /* P9ag【漏参数修复】—— 逐字段对齐 APP 真实报文（roomwatch dump 到的 IM type=100 content）：
+   *   APP 实际下发字段：serverSeq/cantShowInSongPlay/ignoreUserIds/onlyCanSeeUserIds/roomId/
+   *                     commandType/formerSongId/targetSongId/progress/playStatus/clientSeq/
+   *                     sendUid/pushFreq/operateMsg
+   *   我们此前**漏了** cantShowInSongPlay/ignoreUserIds/onlyCanSeeUserIds/roomId/pushFreq，
+   *   且**多了** triggerType（APP 无此字段）→ 服务端虽返回 result:true（假成功），
+   *   APP 却因报文不完整/字段异常而不执行。
+   *   另外 APP 用 sendUid 而非 userId —— 补上 sendUid 双写。 */
+  if (c.cantShowInSongPlay === undefined) c.cantShowInSongPlay = true;
+  if (c.ignoreUserIds === undefined) c.ignoreUserIds = null;
+  if (c.onlyCanSeeUserIds === undefined) c.onlyCanSeeUserIds = null;
+  if (!c.roomId) c.roomId = roomId;
+  if (!c.pushFreq) c.pushFreq = 'client';
+  delete c.triggerType;   // P9ag: APP 报文无此字段
+  if (c.userId !== undefined && c.sendUid === undefined) c.sendUid = c.userId;  // 双写 sendUid
   const info = JSON.stringify(c);
   const r = await weapiPost('/api/listen/together/play/command/report', { roomId: roomId, commandInfo: info }, cookie);
   const j = parse(r.text);

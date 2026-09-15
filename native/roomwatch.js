@@ -32,16 +32,40 @@ function createRoomWatch() {
   let enterTs = 0;
   let onHuman = null;    // 收到真人消息时回调（可选，用于即时推送）
 
+  /** P9ae: 诊断计数（每条原始消息都记录，用于定位"漏收"）。 */
+  let _rawCount = 0, _rejNotif = 0, _rejSelf = 0, _rejNoText = 0, _rejOld = 0, _rejDup = 0, _accepted = 0;
+
   /** 是否值得处理：非通知、非自己、有文本、未见过、且在进房之后 */
   function accept(m) {
     if (!m) return false;
-    if (m.isNotification) return false;   // 进房/退房系统消息
-    if (m.isSelf) return false;           // 自己（AI）发的
-    if (!m.text) return false;            // 无正文
-    if (started && enterTs && m.time && m.time < enterTs) return false; // 进房前的历史
+    _rawCount += 1;
+    /* P9ae: 打印每一条收到的原始消息（含被拒的），便于定位"漏收/误过滤" */
+    try {
+      console.log('[roomwatch][raw]', JSON.stringify({
+        n: _rawCount, isSelf: m.isSelf, notif: m.isNotification, type: m.messageType,
+        sender: m.senderId, nick: m.senderNick, time: m.time, enterTs: enterTs,
+        text: String(m.text || '').slice(0, 40),
+      }));
+    } catch (e) {}
+    if (m.isNotification) { _rejNotif += 1; return false; }   // 进房/退房系统消息
+    /* P9af: type=100 是「自定义消息」——网易云 APP 发送播放指令(PlayCommandMsg)的真实通道！
+     * 必须 dump 完整结构，才能对比"我们发的"与"APP 发的"字段差异。 */
+    if (m.messageType === 100 || (m.raw && m.raw.messageType === 100)) {
+      try {
+        const raw = m.raw || {};
+        /* P9af: 全量落盘，便于逐字段对比「我们发的」与「APP 发的」 */
+        const line = JSON.stringify({ sender: m.senderId, time: m.time, raw: raw }) + '\n';
+        require('fs').appendFileSync('/tmp/mt100.log', line);
+      } catch (e) {}
+    }
+    if (m.isSelf) { _rejSelf += 1; return false; }            // 自己（AI）发的
+    if (!m.text) { _rejNoText += 1; return false; }           // 无正文
+    if (started && enterTs && m.time && m.time < enterTs) { _rejOld += 1; return false; } // 进房前的历史
     const id = m.id || (String(m.senderId) + '|' + String(m.time) + '|' + m.text);
-    if (seen[id]) return false;
+    if (seen[id]) { _rejDup += 1; return false; }
     seen[id] = 1;
+    _accepted += 1;
+    console.log('[roomwatch][accept]', m.senderNick || '', '|', String(m.text || '').slice(0, 40));
     return true;
   }
 
@@ -96,6 +120,8 @@ function createRoomWatch() {
       seq: seq,
       bufferLen: buffer.length,
       seen: Object.keys(seen).length,
+      /* P9ae: 原始消息诊断计数 */
+      diag: { raw: _rawCount, notif: _rejNotif, self: _rejSelf, noText: _rejNoText, old: _rejOld, dup: _rejDup, accepted: _accepted },
     };
   }
 
