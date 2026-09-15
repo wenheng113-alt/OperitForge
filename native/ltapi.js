@@ -99,7 +99,7 @@ function eapiPost(path, obj, cookie) {
         'Content-Length': Buffer.byteLength(body),
         'Cookie': mergeCookies(DEVICE_COOKIE, cookie || ''),
       },
-      timeout: 15000,
+      timeout: 30000,
     }, function (res) {
       let data = '';
       res.setEncoding('utf8');

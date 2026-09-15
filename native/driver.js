@@ -115,6 +115,9 @@ function createDriver() {
         account: status.account,
         accounts: status.accounts,
         remoteUsers: status.remoteUsers || [],
+        /* P9l: 暴露房间歌单镜像（最近一次 syncOnce 的 displayList），
+         * 供 pushSongToRoom 免去「先慢读列表」的 8s 阻塞。 */
+        remotePlaylist: status.remotePlaylist || [],
         lastError: status.lastError,
         lastSyncTs: status.lastSyncTs,
         forwarded: status.forwarded,
@@ -403,6 +406,10 @@ function createDriver() {
     /** P4: 单次房间状态回读 → 写入本地 state 并广播 */
     async syncOnce() {
       if (!status.connected || !status.roomId) return null;
+      /* P9l: 防重入 —— 房间歌单大时单次 syncPlaylist 可能 8s+，
+       * 2s 间隔会不断叠加请求，导致 eapi 排队整体变慢（addSongs 被牵连超时）。 */
+      if (status._syncing) return null;
+      status._syncing = true;
       try {
         const r = await ltapi.statusGet('ai', status.roomId);
         if (!r.ok) { if (r.message) log('P4 statusGet failed:', r.message); return null; }
@@ -431,6 +438,8 @@ function createDriver() {
       } catch (e) {
         log('P4 syncOnce error:', String((e && e.message) || e));
         return null;
+      } finally {
+        status._syncing = false;   /* P9l: 释放重入锁 */
       }
     },
 

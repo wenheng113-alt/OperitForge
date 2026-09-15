@@ -510,23 +510,38 @@ function pushSongToRoom(songId, opts) {
   const sid = String(songId);
   const roomId = ds.roomId;
   const playing = o.playing !== false;
-  ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 6, verifyDelayMs: 1500 })
+  /* P9l: 核心修复 —— 不再「先 addSongs（慢，列表大时 8s+ 甚至撞 15s 超时）再切歌」。
+   * 旧实现一旦 addSongs 超时被中断，后面的 GOTO **根本没发出**（catch 吞掉），
+   * 表现为「在 APP 让 AI 换歌不切」。
+   * 现在：**立即下发 GOTO**；加歌放后台，完成后再补发一次（覆盖「列表外 GOTO 被拒」的情况）。
+   * 判据：若歌已在 driver 的房间歌单镜像里 → 直接切（reportCommand 实测 ~0.2s）。 */
+  const mirror = Array.isArray(ds.remotePlaylist) ? ds.remotePlaylist.map(String) : [];
+  const inRoom = mirror.indexOf(sid) >= 0;
+  function dispatchLoad() {
+    selfControl({
+      action: 'load',
+      song: { id: sid, name: (o.name || ''), artist: (o.artist || '') },
+      position: 0,
+      autoplay: playing,
+      by: 'ai',
+    });
+    console.log('[song→room] dispatch /control load id=' + sid + ' (inRoom=' + inRoom + ')');
+  }
+  /* ① 立即切歌（不等加歌） */
+  dispatchLoad();
+  if (inRoom) return;
+  /* ② 歌不在镜像里：后台 REPLACE 进列表，成功后补发一次 GOTO
+   *    （列表外的 GOTO 会被服务端静默拒绝，故必须等列表更新后再切一次）。 */
+  ltapi.addSongs('ai', roomId, [sid], { dedupe: true, verify: true, verifyRetries: 3, verifyDelayMs: 1500 })
     .then(function (r) {
-      console.log('[song→room] addSongs ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
-      /* 等列表传播稳定后，再经 /control（handleControl 补全 clientSeq/triggerType/userId）下发播放 */
-      return new Promise(function (res) { setTimeout(res, 1800); });
+      console.log('[song→room] addSongs(bg) ok=' + (r && r.ok) + ' verified=' + (r && r.verified) + ' id=' + sid);
+      if (!r || !r.ok) return;
+      /* 等列表传播稳定后补发（3.5s 覆盖 REPLACE 的 3–5s 服务端延迟） */
+      setTimeout(function () {
+        try { dispatchLoad(); console.log('[song→room] re-dispatch after add id=' + sid); } catch (e) {}
+      }, 3500);
     })
-    .then(function () {
-      selfControl({
-        action: 'load',
-        song: { id: sid, name: (o.name || ''), artist: (o.artist || '') },
-        position: 0,
-        autoplay: playing,
-        by: 'ai',
-      });
-      console.log('[song→room] dispatch /control load id=' + sid);
-    })
-    .catch(function (e) { console.log('[song→room] err:', (e && e.message) || e); });
+    .catch(function (e) { console.log('[song→room] addSongs(bg) err:', (e && e.message) || e); });
 }
 
 function fetchUpstreamJson(pathWithQuery) {
