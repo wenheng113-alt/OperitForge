@@ -370,9 +370,9 @@ async function reportCommand(who, roomId, cmd) {
   const c = Object.assign({}, cmd || {});
   const _t = Date.now();
   if (!c.clientSeq) c.clientSeq = _t;
-  if (c.clientTime == null) c.clientTime = _t;
   if (c.playStatus === 'PLAYING') c.playStatus = 'PLAY';
   if (c.playStatus === 'PAUSED') c.playStatus = 'PAUSE';
+  delete c.clientTime;   // P9j: 官方抓包无此字段，去掉以完全对齐
   const info = JSON.stringify(c);
   const r = await weapiPost('/api/listen/together/play/command/report', { roomId: roomId, commandInfo: info }, cookie);
   const j = parse(r.text);

@@ -541,9 +541,9 @@ function createDriver() {
       const _seqNow = Date.now();
       const cmd = {
         clientSeq: _seqNow,
-        clientTime: _seqNow,
-        serverSeq: 0,
-        ignoreUserId: [],
+        /* P9j: 完全对齐官方抓包字段（无 clientTime / ignoreUserId）。
+         * serverSeq 必须回填**房间当前值**，否则 APP 可能认为指令不对应当前房间状态。 */
+        serverSeq: (status.lastRemote && Number(status.lastRemote.serverSeq)) || 0,
         triggerType: 'MANUAL',
         userId: status.creatorId || undefined,
       };
